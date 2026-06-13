@@ -4,6 +4,8 @@ import {
   scrubEvent,
   phiBeforeSend,
   createPhiBeforeSend,
+  isNoise,
+  createBeforeSend,
   type SentryEventLike,
 } from './index';
 
@@ -161,5 +163,79 @@ describe('createPhiBeforeSend', () => {
     expect(beforeSend({ extra: { email: 'a@b.c', foo: 'bar' } }).extra).toEqual(
       { email: '[REDACTED]', foo: '[REDACTED]' },
     );
+  });
+});
+
+describe('isNoise', () => {
+  it('is false when no options are given', () => {
+    expect(isNoise({ level: 'warning' })).toBe(false);
+  });
+
+  it('flags warning-and-below levels when dropWarnings is set', () => {
+    const opts = { dropWarnings: true };
+    expect(isNoise({ level: 'warning' }, opts)).toBe(true);
+    expect(isNoise({ level: 'info' }, opts)).toBe(true);
+    expect(isNoise({ level: 'debug' }, opts)).toBe(true);
+    expect(isNoise({ level: 'log' }, opts)).toBe(true);
+    expect(isNoise({ level: 'WARNING' }, opts)).toBe(true); // case-insensitive
+  });
+
+  it('does not flag error/fatal when dropWarnings is set', () => {
+    const opts = { dropWarnings: true };
+    expect(isNoise({ level: 'error' }, opts)).toBe(false);
+    expect(isNoise({ level: 'fatal' }, opts)).toBe(false);
+    expect(isNoise({}, opts)).toBe(false); // no level => not noise
+  });
+
+  it('matches dropPatterns against message, logentry and exception text', () => {
+    const opts = { dropPatterns: [/subscription not found/i] };
+    expect(isNoise({ message: 'Subscription not found: SUB_1' }, opts)).toBe(
+      true,
+    );
+    expect(
+      isNoise({ logentry: { message: 'subscription NOT FOUND x' } }, opts),
+    ).toBe(true);
+    expect(
+      isNoise(
+        { exception: { values: [{ type: 'Error', value: 'Subscription not found' }] } },
+        opts,
+      ),
+    ).toBe(true);
+    expect(isNoise({ message: 'something else' }, opts)).toBe(false);
+  });
+});
+
+describe('createBeforeSend', () => {
+  it('drops noise (returns null) and keeps real errors', () => {
+    const beforeSend = createBeforeSend({ dropWarnings: true });
+    expect(beforeSend({ level: 'warning', message: 'noisy' })).toBeNull();
+    expect(beforeSend({ level: 'error', message: 'real' })).not.toBeNull();
+  });
+
+  it('scrubs PII on events that survive the noise filter', () => {
+    const beforeSend = createBeforeSend({ dropWarnings: true });
+    const out = beforeSend({
+      level: 'error',
+      user: { id: '7', email: 'a@b.c' },
+      extra: { email: 'a@b.c', ok: 'x' },
+    });
+    expect(out).not.toBeNull();
+    expect(out?.user).toEqual({ id: '7' });
+    expect(out?.extra).toEqual({ email: '[REDACTED]', ok: 'x' });
+  });
+
+  it('drops events matching dropPatterns regardless of level', () => {
+    const beforeSend = createBeforeSend({
+      dropPatterns: [/broker transport failure/i],
+    });
+    expect(
+      beforeSend({ level: 'error', message: 'librdkafka: Broker transport failure' }),
+    ).toBeNull();
+    expect(beforeSend({ level: 'error', message: 'genuine bug' })).not.toBeNull();
+  });
+
+  it('is a no-op passthrough (plus PII scrub) when no options are given', () => {
+    const beforeSend = createBeforeSend();
+    expect(beforeSend({ level: 'warning', message: 'kept' })).not.toBeNull();
   });
 });
