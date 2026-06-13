@@ -63,8 +63,40 @@ var phiBeforeSend = (event) => scrubEvent(event);
 function createPhiBeforeSend(opts) {
   return (event) => scrubEvent(event, opts);
 }
+var NOISE_LEVELS = /* @__PURE__ */ new Set(["warning", "info", "debug", "log"]);
+function eventText(event) {
+  const parts = [];
+  if (typeof event.message === "string") parts.push(event.message);
+  if (event.logentry && typeof event.logentry.message === "string") {
+    parts.push(event.logentry.message);
+  }
+  for (const ex of event.exception?.values ?? []) {
+    if (ex.type) parts.push(ex.type);
+    if (ex.value) parts.push(ex.value);
+  }
+  return parts.join("\n");
+}
+function isNoise(event, opts) {
+  if (!event || typeof event !== "object" || !opts) return false;
+  if (opts.dropWarnings && typeof event.level === "string" && NOISE_LEVELS.has(event.level.toLowerCase())) {
+    return true;
+  }
+  if (opts.dropPatterns?.length) {
+    const text = eventText(event);
+    if (text && opts.dropPatterns.some((re) => re.test(text))) return true;
+  }
+  return false;
+}
+function createBeforeSend(opts) {
+  return (event) => {
+    if (isNoise(event, opts)) return null;
+    return scrubEvent(event, opts);
+  };
+}
 export {
+  createBeforeSend,
   createPhiBeforeSend,
+  isNoise,
   phiBeforeSend,
   scrubEvent,
   scrubPII

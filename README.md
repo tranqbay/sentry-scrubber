@@ -15,7 +15,7 @@ In a tranqbay service repo's `package.json`:
 ```json
 {
   "optionalDependencies": {
-    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v0.1.0"
+    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v0.2.0"
   }
 }
 ```
@@ -101,6 +101,39 @@ const beforeSend = createPhiBeforeSend({
 ```
 
 The `additionalKeys` regex is OR'd with the default set; defaults still apply.
+
+## Dropping noise (warnings + patterns)
+
+Beyond PII scrubbing, the package can drop non-actionable events before they
+reach GlitchTip. Use `createBeforeSend` — it drops noise (returns `null`) and
+then scrubs PII on whatever survives, so a service wires in **one** callback:
+
+```typescript
+import { createBeforeSend } from '@tranqbay/sentry-scrubber';
+
+Sentry.init({
+  // ...
+  beforeSend: createBeforeSend({
+    dropWarnings: true, // warnings are operational, not errors — never forward them
+    dropPatterns: [/broker transport failure/i, /subscription not found/i],
+    additionalKeys: /^(chartId|clinicalNote)$/i, // ScrubOptions still honored
+  }),
+});
+```
+
+- **`dropWarnings`** — drops events at or below `warning` severity
+  (`warning`/`info`/`debug`/`log`). This enforces "warnings never reach
+  GlitchTip" centrally, so services don't have to hand-roll a logger that
+  refrains from forwarding warns (the copy-pasted `SentryLogger.warn()` →
+  `captureMessage` pattern that caused per-id issue sprawl). `error`/`fatal`
+  pass through.
+- **`dropPatterns`** — drops events whose message/logentry/exception text
+  matches any pattern. For known third-party noise families (e.g. Kafka
+  transport churn) a service wants suppressed at the edge.
+
+`isNoise(event, opts)` is exported separately if you need the predicate inside
+an existing `beforeSend` (e.g. a Next.js config that already returns `null` for
+some cases) — return `null` when it's `true`, then call `phiBeforeSend`.
 
 ## Bumping the package
 

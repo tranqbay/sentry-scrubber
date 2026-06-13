@@ -20,6 +20,14 @@ export type SentryEventLike = {
     message?: unknown;
     [k: string]: unknown;
   }>;
+  /** Severity: 'fatal' | 'error' | 'warning' | 'info' | 'debug' | 'log'. */
+  level?: string;
+  message?: unknown;
+  logentry?: { message?: unknown; [k: string]: unknown };
+  exception?: {
+    values?: Array<{ type?: string; value?: string; [k: string]: unknown }>;
+    [k: string]: unknown;
+  };
   [k: string]: unknown;
 };
 
@@ -113,4 +121,72 @@ export const phiBeforeSend = <T extends SentryEventLike>(event: T): T =>
 /** Factory for service-specific scrubbers. */
 export function createPhiBeforeSend(opts: ScrubOptions) {
   return <T extends SentryEventLike>(event: T): T => scrubEvent(event, opts);
+}
+
+export interface NoiseOptions {
+  /**
+   * Drop events at or below `warning` severity (warning/info/debug/log).
+   * Warnings are operational signals, not errors — forwarding them to error
+   * tracking (e.g. via a logger that captures every warn) generates large
+   * volumes of non-actionable issues. Enable this to enforce "warnings never
+   * reach GlitchTip" centrally, regardless of how each service logs.
+   */
+  dropWarnings?: boolean;
+  /**
+   * Drop events whose message/logentry/exception text matches any of these
+   * patterns. For known-noise families a service wants suppressed at the edge
+   * (e.g. expected third-party transport churn).
+   */
+  dropPatterns?: RegExp[];
+}
+
+const NOISE_LEVELS = new Set(['warning', 'info', 'debug', 'log']);
+
+/** Collects the text-bearing fields of an event for pattern matching. */
+function eventText(event: SentryEventLike): string {
+  const parts: string[] = [];
+  if (typeof event.message === 'string') parts.push(event.message);
+  if (event.logentry && typeof event.logentry.message === 'string') {
+    parts.push(event.logentry.message);
+  }
+  for (const ex of event.exception?.values ?? []) {
+    if (ex.type) parts.push(ex.type);
+    if (ex.value) parts.push(ex.value);
+  }
+  return parts.join('\n');
+}
+
+/** Returns true when an event is non-actionable noise per `opts`. */
+export function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean {
+  if (!event || typeof event !== 'object' || !opts) return false;
+  if (
+    opts.dropWarnings &&
+    typeof event.level === 'string' &&
+    NOISE_LEVELS.has(event.level.toLowerCase())
+  ) {
+    return true;
+  }
+  if (opts.dropPatterns?.length) {
+    const text = eventText(event);
+    if (text && opts.dropPatterns.some((re) => re.test(text))) return true;
+  }
+  return false;
+}
+
+/**
+ * Composed beforeSend for Sentry.init: drops non-actionable noise (returns
+ * `null`, which tells Sentry to discard the event) and then scrubs PII from
+ * everything that survives. A single building block so every service gets
+ * consistent noise-filtering + PII redaction and can't regress by hand-rolling
+ * its own logger/filter.
+ *
+ *   Sentry.init({
+ *     beforeSend: createBeforeSend({ dropWarnings: true }),
+ *   });
+ */
+export function createBeforeSend(opts?: ScrubOptions & NoiseOptions) {
+  return <T extends SentryEventLike>(event: T): T | null => {
+    if (isNoise(event, opts)) return null;
+    return scrubEvent(event, opts);
+  };
 }
