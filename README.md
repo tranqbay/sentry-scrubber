@@ -1,16 +1,16 @@
 # @tranqbay/sentry-scrubber
 
-Internal Sentry/Glitchtip `beforeSend` PII scrubber for tranqbay services.
+A small, dependency-free `beforeSend` PII/PHI scrubber (and noise filter) for the Sentry / GlitchTip JavaScript SDK.
 
 ## Why
 
-Glitchtip (self-hosted Sentry-compatible error tracker at `<redacted>`) does not yet have server-side data scrubbing (tracking issues: [#134](https://gitlab.com/glitchtip/glitchtip-backend/-/issues/134), [#251](https://gitlab.com/glitchtip/glitchtip-backend/-/issues/251), [#315](https://gitlab.com/glitchtip/glitchtip-backend/-/work_items/315), all open).
+Self-hosted, Sentry-compatible error trackers (e.g. GlitchTip) don't provide the server-side data scrubbing that Sentry's hosted product does (see GlitchTip issues [#134](https://gitlab.com/glitchtip/glitchtip-backend/-/issues/134), [#251](https://gitlab.com/glitchtip/glitchtip-backend/-/issues/251), [#315](https://gitlab.com/glitchtip/glitchtip-backend/-/work_items/315)). The reliable place to remove sensitive data is therefore the SDK's `beforeSend` hook, before events ever leave the process.
 
-This package centralises the SDK-level scrubbing logic so PHI keys and email-shaped strings are redacted before events leave each service process. One source of truth, no per-repo drift.
+This package centralises that logic so PII/PHI keys and email-shaped strings are redacted consistently, with no per-repo drift.
 
 ## Install
 
-In a tranqbay service repo's `package.json`:
+In your service's `package.json`:
 
 ```json
 {
@@ -20,7 +20,7 @@ In a tranqbay service repo's `package.json`:
 }
 ```
 
-Use `optionalDependencies` for Node.js backends so a contractor without read access to this repo can still build the consumer locally (the consumer's `instrument.ts` falls back to a no-op in dev). For the frontend bundle, use `dependencies` instead since the dep is bundled at build time and the runtime fallback is not relevant.
+Use `optionalDependencies` for Node.js backends so a build where the package isn't available still succeeds (the consumer's `instrument.ts` falls back to a no-op). For frontend bundles, use `dependencies` instead, since the dep is bundled at build time and the runtime fallback isn't relevant.
 
 ## Usage (NestJS backend)
 
@@ -130,14 +130,12 @@ Sentry.init({
 ```
 
 - **`dropWarnings`** — drops events at or below `warning` severity
-  (`warning`/`info`/`debug`/`log`). This enforces "warnings never reach
-  GlitchTip" centrally, so services don't have to hand-roll a logger that
-  refrains from forwarding warns (the copy-pasted `SentryLogger.warn()` →
-  `captureMessage` pattern that caused per-id issue sprawl). `error`/`fatal`
-  pass through.
+  (`warning`/`info`/`debug`/`log`). This enforces "warnings never reach the
+  error tracker" centrally, so services don't have to hand-roll a logger that
+  refrains from forwarding warnings. `error`/`fatal` pass through.
 - **`dropPatterns`** — drops events whose message/logentry/exception text
-  matches any pattern. For known third-party noise families (e.g. Kafka
-  transport churn) a service wants suppressed at the edge.
+  matches any pattern. For known, non-actionable noise families (e.g. recurring
+  third-party transport churn) a service wants suppressed at the edge.
 
 `isNoise(event, opts)` is exported separately if you need the predicate inside
 an existing `beforeSend` (e.g. a Next.js config that already returns `null` for
