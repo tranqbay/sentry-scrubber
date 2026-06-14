@@ -1,9 +1,11 @@
 /**
  * @tranqbay/sentry-scrubber
  *
- * PII redaction for Sentry/Glitchtip events. Walks the event before send
- * and replaces values under known PII keys with [REDACTED], replaces
- * email-shaped strings with [EMAIL].
+ * PII redaction for Sentry/Glitchtip events. Walks the event before send and
+ * replaces values under sensitive keys with [REDACTED] and email-shaped strings
+ * with [EMAIL] — across user, request data/query/headers, extra, contexts,
+ * breadcrumbs, AND the freeform error text (message, logentry, exception
+ * values) where PII most often leaks.
  *
  * Two consumption modes:
  *  - phiBeforeSend: drop-in default for Sentry.init({ beforeSend: ... })
@@ -38,12 +40,29 @@ export interface ScrubOptions {
   preserveUserId?: boolean;
 }
 
+// Exact-match key names (case-insensitive). Generic words live here so we don't
+// over-redact lookalikes (e.g. "name" must not match "filename"/"username").
 const DEFAULT_PII_KEYS =
   /^(email|phone|phoneNumber|firstName|first_name|lastName|last_name|fullName|full_name|name|dob|date_of_birth|birthdate|ssn|address|street|city|zip|postal|postalCode|password|token|secret|apiKey|api_key|authorization|cookie|messageBody|message_body|content|notes|symptom|diagnosis|medication|prescription|recipientEmail|recipient_email|recipientName|recipient_name)$/i;
+// High-signal tokens matched as a SUBSTRING, so compound keys are caught too —
+// e.g. userEmail, patientPhone, csrfToken, billingSsn. Deliberately omits
+// generic words like "name"/"address"/"content" to avoid over-redaction.
+const SENSITIVE_KEY_TOKENS =
+  /(email|password|passwd|secret|token|apikey|api_key|authorization|auth_token|accesstoken|access_token|refreshtoken|cookie|ssn|creditcard|credit_card|cardnumber|card_number|cvv|cvc|phone|firstname|lastname|fullname)/i;
 const EMAIL_REGEX = /[\w.+-]+@[\w-]+\.[\w.-]+/g;
 const REDACTED = '[REDACTED]';
 const EMAIL_PLACEHOLDER = '[EMAIL]';
 const MAX_DEPTH = 6;
+
+/** Redact email-shaped substrings from a freeform string. */
+function scrubString(value: string): string {
+  return value.replace(EMAIL_REGEX, EMAIL_PLACEHOLDER);
+}
+
+/** True if an object key name denotes sensitive data (exact or token match). */
+function isSensitiveKey(key: string, combinedExact: RegExp): boolean {
+  return combinedExact.test(key) || SENSITIVE_KEY_TOKENS.test(key);
+}
 
 function combinePatterns(base: RegExp, additional?: RegExp): RegExp {
   if (!additional) return base;
@@ -60,7 +79,7 @@ export function scrubPII(
 ): unknown {
   if (depth > MAX_DEPTH || value == null) return value;
   if (typeof value === 'string') {
-    return value.replace(EMAIL_REGEX, EMAIL_PLACEHOLDER);
+    return scrubString(value);
   }
   if (Array.isArray(value)) {
     return value.map((v) => scrubPII(v, opts, depth + 1));
@@ -69,7 +88,7 @@ export function scrubPII(
     const keys = combinePatterns(DEFAULT_PII_KEYS, opts?.additionalKeys);
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = keys.test(k) ? REDACTED : scrubPII(v, opts, depth + 1);
+      out[k] = isSensitiveKey(k, keys) ? REDACTED : scrubPII(v, opts, depth + 1);
     }
     return out;
   }
@@ -95,6 +114,14 @@ export function scrubEvent<T extends SentryEventLike>(
   if (event.request?.query_string) {
     event.request.query_string = REDACTED;
   }
+  // Headers can carry cookie / authorization — walk them so the key match
+  // (cookie/authorization/token) redacts and emails in values are masked.
+  if (event.request && (event.request as { headers?: unknown }).headers) {
+    (event.request as { headers?: unknown }).headers = scrubPII(
+      (event.request as { headers?: unknown }).headers,
+      opts,
+    );
+  }
   if (event.extra) {
     event.extra = scrubPII(event.extra, opts) as Record<string, unknown>;
   }
@@ -105,11 +132,23 @@ export function scrubEvent<T extends SentryEventLike>(
     event.breadcrumbs = event.breadcrumbs.map((b) => ({
       ...b,
       data: b.data ? scrubPII(b.data, opts) : b.data,
-      message:
-        typeof b.message === 'string'
-          ? b.message.replace(EMAIL_REGEX, EMAIL_PLACEHOLDER)
-          : b.message,
+      message: typeof b.message === 'string' ? scrubString(b.message) : b.message,
     }));
+  }
+  // The most common PII leak: freeform error text. Scrub the top-level message,
+  // the structured logentry message, and every exception value.
+  if (typeof event.message === 'string') {
+    event.message = scrubString(event.message);
+  }
+  if (event.logentry && typeof event.logentry.message === 'string') {
+    event.logentry.message = scrubString(event.logentry.message);
+  }
+  if (event.exception?.values) {
+    for (const ex of event.exception.values) {
+      if (typeof ex.value === 'string') {
+        ex.value = scrubString(ex.value);
+      }
+    }
   }
   return event;
 }
@@ -168,7 +207,17 @@ export function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean {
   }
   if (opts.dropPatterns?.length) {
     const text = eventText(event);
-    if (text && opts.dropPatterns.some((re) => re.test(text))) return true;
+    if (
+      text &&
+      opts.dropPatterns.some((re) => {
+        // Reset lastIndex so a caller-supplied /g regex doesn't intermittently
+        // miss across calls (stateful .test()).
+        re.lastIndex = 0;
+        return re.test(text);
+      })
+    ) {
+      return true;
+    }
   }
   return false;
 }

@@ -15,7 +15,7 @@ In a tranqbay service repo's `package.json`:
 ```json
 {
   "optionalDependencies": {
-    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v0.2.0"
+    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v0.3.0"
   }
 }
 ```
@@ -82,9 +82,17 @@ Same pattern in `sentry.server.config.ts` and `sentry.edge.config.ts`.
 ## What gets scrubbed
 
 - `event.user` reduced to `{ id }` only (drop entirely with `preserveUserId: false`)
-- `event.request.data`, `event.extra`, `event.contexts`, `event.breadcrumbs[].data`: walked recursively, values under keys matching the PII pattern replaced with `[REDACTED]`
+- `event.request.data`, `event.request.headers`, `event.extra`, `event.contexts`, `event.breadcrumbs[].data`: walked recursively, values under sensitive keys replaced with `[REDACTED]`
+- **Freeform error text** — `event.message`, `event.logentry.message`, and every `event.exception.values[].value`: emails masked (this is where PII most often leaks)
 - All string values: emails replaced with `[EMAIL]`
 - `event.request.query_string`: replaced wholesale with `[REDACTED]`
+
+### Key matching
+
+- **Exact** match for generic words (`name`, `address`, `city`, `content`, …) so lookalikes like `username`/`filename` are not over-redacted.
+- **Substring** match for high-signal tokens (`email`, `password`, `secret`, `token`, `authorization`, `cookie`, `ssn`, `creditCard`, `cvv`, `phone`, `firstName`/`lastName`/`fullName`) so compound keys like `userEmail`, `patientPhone`, `csrfToken` are caught.
+
+> Residual risk: freeform PII other than emails (e.g. a name typed into an error message) is not detected. Keep PII out of log/exception messages.
 
 ## Default PII key set (case-insensitive, snake_case variants matched)
 
