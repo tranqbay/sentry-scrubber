@@ -129,6 +129,72 @@ describe('scrubEvent', () => {
   it('returns non-object inputs unchanged', () => {
     expect(scrubEvent(null as unknown as SentryEventLike)).toBe(null);
   });
+
+  it('scrubs emails in the top-level message and logentry', () => {
+    const out = scrubEvent({
+      message: 'Failed for patient a@b.c',
+      logentry: { message: 'retry for x@y.io' },
+    });
+    expect(out.message).toBe('Failed for patient [EMAIL]');
+    expect(out.logentry?.message).toBe('retry for [EMAIL]');
+  });
+
+  it('scrubs emails inside exception values (freeform error text)', () => {
+    const out = scrubEvent({
+      exception: {
+        values: [
+          { type: 'Error', value: 'No subscription for jane@doe.com' },
+          { type: 'Error', value: undefined },
+        ],
+      },
+    });
+    expect(out.exception?.values?.[0]?.value).toBe(
+      'No subscription for [EMAIL]',
+    );
+    expect(out.exception?.values?.[0]?.type).toBe('Error');
+  });
+
+  it('scrubs request.headers (cookie/authorization redacted, emails masked)', () => {
+    const out = scrubEvent({
+      request: {
+        headers: {
+          cookie: 'session=abc',
+          authorization: 'Bearer xyz',
+          'x-user': 'a@b.c',
+          'content-type': 'application/json',
+        },
+      },
+    });
+    const h = out.request?.headers as Record<string, string>;
+    expect(h.cookie).toBe('[REDACTED]');
+    expect(h.authorization).toBe('[REDACTED]');
+    expect(h['x-user']).toBe('[EMAIL]');
+    expect(h['content-type']).toBe('application/json');
+  });
+});
+
+describe('compound key matching', () => {
+  it('redacts compound sensitive keys', () => {
+    expect(
+      scrubPII({
+        userEmail: 'a@b.c',
+        patientPhone: '555',
+        csrfToken: 'x',
+        accessToken: 'y',
+      }),
+    ).toEqual({
+      userEmail: '[REDACTED]',
+      patientPhone: '[REDACTED]',
+      csrfToken: '[REDACTED]',
+      accessToken: '[REDACTED]',
+    });
+  });
+
+  it('does NOT over-redact generic lookalike keys', () => {
+    expect(
+      scrubPII({ username: 'ada', filename: 'a.txt', displayName: 'Ada L' }),
+    ).toEqual({ username: 'ada', filename: 'a.txt', displayName: 'Ada L' });
+  });
 });
 
 describe('phiBeforeSend', () => {
