@@ -1,9 +1,11 @@
 /**
  * @tranqbay/sentry-scrubber
  *
- * PII redaction for Sentry/Glitchtip events. Walks the event before send
- * and replaces values under known PII keys with [REDACTED], replaces
- * email-shaped strings with [EMAIL].
+ * PII redaction for Sentry/Glitchtip events. Walks the event before send and
+ * replaces values under sensitive keys with [REDACTED] and email-shaped strings
+ * with [EMAIL] — across user, request data/query/headers, extra, contexts,
+ * breadcrumbs, AND the freeform error text (message, logentry, exception
+ * values) where PII most often leaks.
  *
  * Two consumption modes:
  *  - phiBeforeSend: drop-in default for Sentry.init({ beforeSend: ... })
