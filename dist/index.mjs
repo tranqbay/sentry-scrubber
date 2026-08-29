@@ -195,11 +195,12 @@ function scrubEvent(event) {
   if (!event || typeof event !== "object") return event;
   const safe = strictEvent(event);
   const target = event;
+  const safeRecord = safe;
   try {
     for (const key of Object.keys(target)) delete target[key];
     Object.assign(target, safe);
     const safeKeys = Object.keys(safe);
-    if (Object.keys(target).length !== safeKeys.length || safeKeys.some((key) => target[key] !== safe[key])) {
+    if (Object.keys(target).length !== safeKeys.length || safeKeys.some((key) => target[key] !== safeRecord[key])) {
       return safe;
     }
     return event;

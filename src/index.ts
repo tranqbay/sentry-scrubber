@@ -290,19 +290,18 @@ export function scrubPII(
   return value;
 }
 
-export function scrubEvent<T extends SentryEventLike>(
-  event: T,
-): T {
+export function scrubEvent<T extends object>(event: T): T {
   if (!event || typeof event !== 'object') return event;
-  const safe = strictEvent(event) as T;
-  const target = event as Record<string, unknown>;
+  const safe = strictEvent(event as unknown as SentryEventLike) as unknown as T;
+  const target = event as unknown as Record<string, unknown>;
+  const safeRecord = safe as unknown as Record<string, unknown>;
   try {
     for (const key of Object.keys(target)) delete target[key];
     Object.assign(target, safe);
     const safeKeys = Object.keys(safe);
     if (
       Object.keys(target).length !== safeKeys.length ||
-      safeKeys.some((key) => target[key] !== safe[key])
+      safeKeys.some((key) => target[key] !== safeRecord[key])
     ) {
       return safe;
     }
@@ -313,7 +312,7 @@ export function scrubEvent<T extends SentryEventLike>(
 }
 
 /** Drop-in beforeSend for Sentry.init using the default tranqbay PHI key set. */
-export const phiBeforeSend = <T extends SentryEventLike>(event: T): T =>
+export const phiBeforeSend = <T extends object>(event: T): T =>
   scrubEvent(event);
 
 export interface NoiseOptions {
@@ -389,8 +388,8 @@ export function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean {
  *   });
  */
 export function createBeforeSend(opts?: NoiseOptions) {
-  return <T extends SentryEventLike>(event: T): T | null => {
-    if (isNoise(event, opts)) return null;
+  return <T extends object>(event: T): T | null => {
+    if (isNoise(event as unknown as SentryEventLike, opts)) return null;
     return scrubEvent(event);
   };
 }
