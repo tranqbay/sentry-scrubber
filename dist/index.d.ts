@@ -62,6 +62,7 @@ interface NoiseOptions {
      * (e.g. expected third-party transport churn).
      */
     dropPatterns?: RegExp[];
+    matchExceptionType?: boolean;
 }
 /** Returns true when an event is non-actionable noise per `opts`. */
 declare function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean;

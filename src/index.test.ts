@@ -78,7 +78,7 @@ describe('scrubEvent', () => {
       timestamp: '2026-08-29T04:00:00Z',
       level: 'ERROR',
       environment: 'staging',
-      release: 'service-v1.2.3',
+      release: 'service@1.2.3+build.5',
       dist: '42',
       logger: 'booking.service',
       server_name: 'booking-7d9f6',
@@ -170,14 +170,14 @@ describe('scrubEvent', () => {
 
     const output = scrubEvent(input);
 
-    expect(output).not.toBe(input);
+    expect(output).toBe(input);
     expect(output).toMatchObject({
       event_id: '0123456789abcdef0123456789abcdef',
       platform: 'javascript',
       timestamp: '2026-08-29T04:00:00Z',
       level: 'error',
       environment: 'staging',
-      release: 'service-v1.2.3',
+      release: 'service@1.2.3+build.5',
       dist: '42',
       logger: 'booking.service',
       server_name: 'booking-7d9f6',
@@ -240,7 +240,7 @@ describe('scrubEvent', () => {
     ]) {
       expect(serialized).not.toContain(value);
     }
-    expect(input.user?.id).toBe('patient-1');
+    expect(input.user).toBeUndefined();
   });
 
   it('drops malformed technical values', () => {
@@ -248,6 +248,9 @@ describe('scrubEvent', () => {
       scrubEvent({
         event_id: 'person@example.com',
         environment: 'patient@example.com',
+        release: 'patient@localhost',
+        logger: '447700900123',
+        server_name: '+447700900123',
         level: 'patient',
         timestamp: 'not-a-time',
         request: { method: 'patient-name' },
@@ -258,17 +261,28 @@ describe('scrubEvent', () => {
   it('returns non-object inputs unchanged', () => {
     expect(scrubEvent(null as unknown as SentryEventLike)).toBe(null);
   });
+
+  it('returns a safe copy when the event cannot be updated', () => {
+    const event = Object.freeze({
+      level: 'error',
+      user: { id: 'patient-1' },
+      message: 'patient@example.com',
+    });
+    const output = scrubEvent(event);
+    expect(output).not.toBe(event);
+    expect(output).toEqual({ level: 'error', message: '[REDACTED]' });
+  });
 });
 
 describe('phiBeforeSend', () => {
   it('uses the strict allowlist', () => {
-    expect(
-      phiBeforeSend({
-        level: 'error',
-        user: { id: 'patient-1' },
-        message: 'patient@example.com',
-      }),
-    ).toEqual({ level: 'error', message: '[REDACTED]' });
+    const event = {
+      level: 'error',
+      user: { id: 'patient-1' },
+      message: 'patient@example.com',
+    };
+    expect(phiBeforeSend(event)).toBe(event);
+    expect(event).toEqual({ level: 'error', message: '[REDACTED]' });
   });
 });
 
@@ -291,6 +305,28 @@ describe('noise filtering', () => {
     expect(isNoise({ level: 'error', message: 'Database failed' }, options)).toBe(
       false,
     );
+  });
+
+  it('matches exception values but not exception types', () => {
+    const options = { dropPatterns: [/error/i] };
+    expect(
+      isNoise(
+        { exception: { values: [{ type: 'TypeError', value: 'Database failed' }] } },
+        options,
+      ),
+    ).toBe(false);
+    expect(
+      isNoise(
+        { exception: { values: [{ type: 'TypeError', value: 'Expected error' }] } },
+        options,
+      ),
+    ).toBe(true);
+    expect(
+      isNoise(
+        { exception: { values: [{ type: 'TypeError', value: 'Database failed' }] } },
+        { dropPatterns: [/TypeError/], matchExceptionType: true },
+      ),
+    ).toBe(true);
   });
 
   it('resets stateful regular expressions', () => {
