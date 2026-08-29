@@ -1,22 +1,17 @@
-/**
- * @tranqbay/sentry-scrubber
- *
- * PII redaction for Sentry/Glitchtip events. Walks the event before send and
- * replaces values under sensitive keys with [REDACTED] and email-shaped strings
- * with [EMAIL] — across user, request data/query/headers, extra, contexts,
- * breadcrumbs, AND the freeform error text (message, logentry, exception
- * values) where PII most often leaks.
- *
- * Two consumption modes:
- *  - phiBeforeSend: drop-in default for Sentry.init({ beforeSend: ... })
- *  - createPhiBeforeSend({ additionalKeys }): factory for service-specific keys
- */
-
 export type SentryEventLike = {
   user?: { id?: string | number; [k: string]: unknown };
-  request?: { data?: unknown; query_string?: unknown; [k: string]: unknown };
+  request?: {
+    method?: unknown;
+    data?: unknown;
+    query_string?: unknown;
+    [k: string]: unknown;
+  };
   extra?: Record<string, unknown>;
   contexts?: Record<string, unknown>;
+  tags?: Record<string, unknown>;
+  transaction?: string;
+  culprit?: string;
+  fingerprint?: string[];
   breadcrumbs?: Array<{
     data?: unknown;
     message?: unknown;
@@ -27,7 +22,13 @@ export type SentryEventLike = {
   message?: unknown;
   logentry?: { message?: unknown; [k: string]: unknown };
   exception?: {
-    values?: Array<{ type?: string; value?: string; [k: string]: unknown }>;
+    values?: Array<{
+      type?: string;
+      value?: string;
+      stacktrace?: unknown;
+      mechanism?: unknown;
+      [k: string]: unknown;
+    }>;
     [k: string]: unknown;
   };
   [k: string]: unknown;
@@ -36,15 +37,13 @@ export type SentryEventLike = {
 export interface ScrubOptions {
   /** Additional regex of object key names to redact, OR'd with the default set. */
   additionalKeys?: RegExp;
-  /** Set false to drop event.user entirely instead of preserving { id }. */
-  preserveUserId?: boolean;
 }
 
 // Exact-match key names (case-insensitive). Generic words live here so we don't
 // over-redact lookalikes (e.g. "name" must not match "filename"/"username").
 const DEFAULT_PII_KEYS =
   /^(email|phone|phoneNumber|firstName|first_name|lastName|last_name|fullName|full_name|name|dob|date_of_birth|birthdate|ssn|address|street|city|zip|postal|postalCode|password|token|secret|apiKey|api_key|authorization|cookie|messageBody|message_body|content|notes|symptom|diagnosis|medication|prescription|recipientEmail|recipient_email|recipientName|recipient_name)$/i;
-// High-signal tokens matched as a SUBSTRING, so compound keys are caught too —
+// High-signal tokens matched as a substring, so compound keys are caught too.
 // e.g. userEmail, patientPhone, csrfToken, billingSsn. Deliberately omits
 // generic words like "name"/"address"/"content" to avoid over-redaction.
 const SENSITIVE_KEY_TOKENS =
@@ -72,12 +71,201 @@ function combinePatterns(base: RegExp, additional?: RegExp): RegExp {
   );
 }
 
+const TECHNICAL_VALUE = /^[A-Za-z0-9_.:/+@<>()#$-]{1,256}$/;
+const CODE_LOCATION = /\.(?:c|cc|cpp|cs|go|java|js|jsx|kt|mjs|cjs|php|py|rb|rs|swift|ts|tsx)(?::\d+)?$/i;
+const TRACE_ID = /^[a-f0-9]{16,32}$/i;
+
+function technicalString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const scrubbed = scrubString(value);
+  return TECHNICAL_VALUE.test(scrubbed) ? scrubbed : undefined;
+}
+
+function codeLocation(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const scrubbed = scrubString(value).split(/[?#]/, 1)[0].slice(0, 512);
+  return CODE_LOCATION.test(scrubbed) ? scrubbed : undefined;
+}
+
+function copyTechnical(
+  source: Record<string, unknown>,
+  fields: string[],
+): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const field of fields) {
+    const value = technicalString(source[field]);
+    if (value !== undefined) output[field] = value;
+  }
+  return output;
+}
+
+function strictEvent(event: SentryEventLike): SentryEventLike {
+  const safe = copyTechnical(event, [
+    'platform',
+    'environment',
+    'release',
+    'dist',
+    'logger',
+    'server_name',
+  ]) as SentryEventLike;
+
+  if (typeof event.event_id === 'string' && /^[a-f0-9]{32}$/i.test(event.event_id)) {
+    safe.event_id = event.event_id;
+  }
+  if (
+    typeof event.level === 'string' &&
+    ['fatal', 'error', 'warning', 'info', 'debug', 'log'].includes(
+      event.level.toLowerCase(),
+    )
+  ) {
+    safe.level = event.level.toLowerCase();
+  }
+  if (
+    typeof event.timestamp === 'number' ||
+    (typeof event.timestamp === 'string' &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(event.timestamp))
+  ) {
+    safe.timestamp = event.timestamp;
+  }
+
+  if (
+    event.request &&
+    typeof event.request.method === 'string' &&
+    /^[A-Z]{3,10}$/.test(event.request.method)
+  ) {
+    safe.request = { method: event.request.method };
+  }
+
+  if (event.breadcrumbs) {
+    safe.breadcrumbs = event.breadcrumbs.map((breadcrumb) => {
+      const output: Record<string, unknown> = {};
+      const type = technicalString(breadcrumb.type);
+      const level = technicalString(breadcrumb.level);
+      if (type) output.type = type;
+      if (level) output.level = level;
+      if (typeof breadcrumb.timestamp === 'number') {
+        output.timestamp = breadcrumb.timestamp;
+      }
+      return output;
+    });
+  }
+
+  if (event.message !== undefined) safe.message = REDACTED;
+  if (event.logentry !== undefined) safe.logentry = { message: REDACTED };
+
+  if (event.exception?.values) {
+    safe.exception = {
+      values: event.exception.values.map((exception) => {
+        const output = copyTechnical(exception, [
+          'type',
+          'module',
+        ]);
+        if (
+          typeof exception.thread_id === 'number' ||
+          (typeof exception.thread_id === 'string' &&
+            /^[a-f0-9-]{1,64}$/i.test(exception.thread_id))
+        ) {
+          output.thread_id = exception.thread_id;
+        }
+        if (exception.value !== undefined) output.value = REDACTED;
+
+        const stacktrace = exception.stacktrace as
+          | { frames?: Array<Record<string, unknown>> }
+          | undefined;
+        if (stacktrace?.frames) {
+          output.stacktrace = {
+            frames: stacktrace.frames.map((frame) => {
+              const safeFrame = copyTechnical(frame, [
+                'function',
+                'module',
+                'instruction_addr',
+                'package',
+                'platform',
+              ]);
+              for (const field of ['filename', 'abs_path']) {
+                const value = codeLocation(frame[field]);
+                if (value) safeFrame[field] = value;
+              }
+              for (const field of ['lineno', 'colno']) {
+                if (typeof frame[field] === 'number') {
+                  safeFrame[field] = frame[field];
+                }
+              }
+              if (typeof frame.in_app === 'boolean') {
+                safeFrame.in_app = frame.in_app;
+              }
+              return safeFrame;
+            }),
+          };
+        }
+
+        const mechanism = exception.mechanism as
+          | Record<string, unknown>
+          | undefined;
+        if (mechanism) {
+          const safeMechanism = copyTechnical(mechanism, [
+            'type',
+            'exception_id',
+            'parent_id',
+          ]);
+          for (const field of ['handled', 'synthetic']) {
+            if (typeof mechanism[field] === 'boolean') {
+              safeMechanism[field] = mechanism[field];
+            }
+          }
+          output.mechanism = safeMechanism;
+        }
+
+        return output;
+      }),
+    };
+  }
+
+  const trace = (event.contexts as Record<string, unknown> | undefined)?.trace;
+  if (trace && typeof trace === 'object') {
+    const source = trace as Record<string, unknown>;
+    const safeTrace = copyTechnical(source, ['op', 'status', 'origin']);
+    for (const field of ['trace_id', 'span_id', 'parent_span_id']) {
+      if (typeof source[field] === 'string' && TRACE_ID.test(source[field])) {
+        safeTrace[field] = source[field];
+      }
+    }
+    safe.contexts = { trace: safeTrace };
+  }
+
+  const debugMeta = event.debug_meta as
+    | { images?: Array<Record<string, unknown>> }
+    | undefined;
+  if (debugMeta?.images) {
+    safe.debug_meta = {
+      images: debugMeta.images.map((image) => {
+        const output = copyTechnical(image, [
+          'type',
+          'debug_id',
+          'code_id',
+          'image_addr',
+          'image_size',
+          'arch',
+        ]);
+        for (const field of ['code_file', 'debug_file']) {
+          const value = codeLocation(image[field]);
+          if (value) output[field] = value;
+        }
+        return output;
+      }),
+    };
+  }
+
+  return safe;
+}
+
 export function scrubPII(
   value: unknown,
   opts?: ScrubOptions,
   depth = 0,
 ): unknown {
-  if (depth > MAX_DEPTH || value == null) return value;
+  if (depth > MAX_DEPTH) return REDACTED;
+  if (value == null) return value;
   if (typeof value === 'string') {
     return scrubString(value);
   }
@@ -97,75 +285,19 @@ export function scrubPII(
 
 export function scrubEvent<T extends SentryEventLike>(
   event: T,
-  opts?: ScrubOptions,
 ): T {
   if (!event || typeof event !== 'object') return event;
-
-  if (event.user) {
-    if (opts?.preserveUserId === false) {
-      delete (event as SentryEventLike).user;
-    } else {
-      event.user = { id: event.user.id };
-    }
-  }
-  if (event.request?.data) {
-    event.request.data = scrubPII(event.request.data, opts);
-  }
-  if (event.request?.query_string) {
-    event.request.query_string = REDACTED;
-  }
-  // Headers can carry cookie / authorization — walk them so the key match
-  // (cookie/authorization/token) redacts and emails in values are masked.
-  if (event.request && (event.request as { headers?: unknown }).headers) {
-    (event.request as { headers?: unknown }).headers = scrubPII(
-      (event.request as { headers?: unknown }).headers,
-      opts,
-    );
-  }
-  if (event.extra) {
-    event.extra = scrubPII(event.extra, opts) as Record<string, unknown>;
-  }
-  if (event.contexts) {
-    event.contexts = scrubPII(event.contexts, opts) as Record<string, unknown>;
-  }
-  if (event.breadcrumbs && Array.isArray(event.breadcrumbs)) {
-    event.breadcrumbs = event.breadcrumbs.map((b) => ({
-      ...b,
-      data: b.data ? scrubPII(b.data, opts) : b.data,
-      message: typeof b.message === 'string' ? scrubString(b.message) : b.message,
-    }));
-  }
-  // The most common PII leak: freeform error text. Scrub the top-level message,
-  // the structured logentry message, and every exception value.
-  if (typeof event.message === 'string') {
-    event.message = scrubString(event.message);
-  }
-  if (event.logentry && typeof event.logentry.message === 'string') {
-    event.logentry.message = scrubString(event.logentry.message);
-  }
-  if (event.exception?.values) {
-    for (const ex of event.exception.values) {
-      if (typeof ex.value === 'string') {
-        ex.value = scrubString(ex.value);
-      }
-    }
-  }
-  return event;
+  return strictEvent(event) as T;
 }
 
 /** Drop-in beforeSend for Sentry.init using the default tranqbay PHI key set. */
 export const phiBeforeSend = <T extends SentryEventLike>(event: T): T =>
   scrubEvent(event);
 
-/** Factory for service-specific scrubbers. */
-export function createPhiBeforeSend(opts: ScrubOptions) {
-  return <T extends SentryEventLike>(event: T): T => scrubEvent(event, opts);
-}
-
 export interface NoiseOptions {
   /**
    * Drop events at or below `warning` severity (warning/info/debug/log).
-   * Warnings are operational signals, not errors — forwarding them to error
+   * Warnings are operational signals, not errors. Forwarding them to error
    * tracking (e.g. via a logger that captures every warn) generates large
    * volumes of non-actionable issues. Enable this to enforce "warnings never
    * reach GlitchTip" centrally, regardless of how each service logs.
@@ -233,9 +365,9 @@ export function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean {
  *     beforeSend: createBeforeSend({ dropWarnings: true }),
  *   });
  */
-export function createBeforeSend(opts?: ScrubOptions & NoiseOptions) {
+export function createBeforeSend(opts?: NoiseOptions) {
   return <T extends SentryEventLike>(event: T): T | null => {
     if (isNoise(event, opts)) return null;
-    return scrubEvent(event, opts);
+    return scrubEvent(event);
   };
 }
