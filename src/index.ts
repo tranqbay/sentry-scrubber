@@ -71,7 +71,8 @@ function combinePatterns(base: RegExp, additional?: RegExp): RegExp {
   );
 }
 
-const TECHNICAL_VALUE = /^[A-Za-z0-9_.:/+@<>()#$-]{1,256}$/;
+const TECHNICAL_VALUE = /^(?=.{1,128}$)(?!.*@)(?!\d{7,}$)[A-Za-z0-9_.:/<>()#$-]+$/;
+const PACKAGE_RELEASE = /^(?=.{1,128}$)(?:@[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]+@v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$/;
 const CODE_LOCATION = /\.(?:c|cc|cpp|cs|go|java|js|jsx|kt|mjs|cjs|php|py|rb|rs|swift|ts|tsx)(?::\d+)?$/i;
 const TRACE_ID = /^[a-f0-9]{16,32}$/i;
 
@@ -79,6 +80,11 @@ function technicalString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const scrubbed = scrubString(value);
   return TECHNICAL_VALUE.test(scrubbed) ? scrubbed : undefined;
+}
+
+function releaseString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  return technicalString(value) ?? (PACKAGE_RELEASE.test(value) ? value : undefined);
 }
 
 function codeLocation(value: unknown): string | undefined {
@@ -103,11 +109,12 @@ function strictEvent(event: SentryEventLike): SentryEventLike {
   const safe = copyTechnical(event, [
     'platform',
     'environment',
-    'release',
     'dist',
     'logger',
     'server_name',
   ]) as SentryEventLike;
+  const release = releaseString(event.release);
+  if (release) safe.release = release;
 
   if (typeof event.event_id === 'string' && /^[a-f0-9]{32}$/i.test(event.event_id)) {
     safe.event_id = event.event_id;
@@ -287,7 +294,22 @@ export function scrubEvent<T extends SentryEventLike>(
   event: T,
 ): T {
   if (!event || typeof event !== 'object') return event;
-  return strictEvent(event) as T;
+  const safe = strictEvent(event) as T;
+  const target = event as Record<string, unknown>;
+  try {
+    for (const key of Object.keys(target)) delete target[key];
+    Object.assign(target, safe);
+    const safeKeys = Object.keys(safe);
+    if (
+      Object.keys(target).length !== safeKeys.length ||
+      safeKeys.some((key) => target[key] !== safe[key])
+    ) {
+      return safe;
+    }
+    return event;
+  } catch {
+    return safe;
+  }
 }
 
 /** Drop-in beforeSend for Sentry.init using the default tranqbay PHI key set. */
@@ -309,19 +331,20 @@ export interface NoiseOptions {
    * (e.g. expected third-party transport churn).
    */
   dropPatterns?: RegExp[];
+  matchExceptionType?: boolean;
 }
 
 const NOISE_LEVELS = new Set(['warning', 'info', 'debug', 'log']);
 
 /** Collects the text-bearing fields of an event for pattern matching. */
-function eventText(event: SentryEventLike): string {
+function eventText(event: SentryEventLike, matchExceptionType = false): string {
   const parts: string[] = [];
   if (typeof event.message === 'string') parts.push(event.message);
   if (event.logentry && typeof event.logentry.message === 'string') {
     parts.push(event.logentry.message);
   }
   for (const ex of event.exception?.values ?? []) {
-    if (ex.type) parts.push(ex.type);
+    if (matchExceptionType && ex.type) parts.push(ex.type);
     if (ex.value) parts.push(ex.value);
   }
   return parts.join('\n');
@@ -338,7 +361,7 @@ export function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean {
     return true;
   }
   if (opts.dropPatterns?.length) {
-    const text = eventText(event);
+    const text = eventText(event, opts.matchExceptionType);
     if (
       text &&
       opts.dropPatterns.some((re) => {

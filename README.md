@@ -15,12 +15,27 @@ In your service's `package.json`:
 ```json
 {
   "optionalDependencies": {
-    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v1.0.0"
+    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v1.1.0"
   }
 }
 ```
 
 Use `optionalDependencies` for Node.js backends so a build where the package isn't available still succeeds (the consumer's `instrument.ts` falls back to a no-op). For frontend bundles, use `dependencies` instead, since the dep is bundled at build time and the runtime fallback isn't relevant.
+
+## Version 1 migration
+
+- use `phiBeforeSend` instead of `createPhiBeforeSend`
+- `event.user` is always removed; `preserveUserId` no longer applies
+- `scrubEvent` accepts only the event, and `createBeforeSend` accepts only noise options
+- `additionalKeys` remains available only through the recursive `scrubPII` utility
+
+The event scrubber returns the scrubbed event and also updates the supplied event
+for compatibility with older wrappers. New integrations should return its result
+from `beforeSend`.
+
+Technical metadata is limited to short code-shaped values. Standard
+`package@semver` release names remain supported, including prerelease and build
+metadata.
 
 ## Usage (NestJS backend)
 
@@ -145,6 +160,9 @@ Sentry.init({
 - **`dropPatterns`** drops events whose message/logentry/exception text
   matches any pattern. For known, non-actionable noise families (e.g. recurring
   third-party transport churn) a service wants suppressed at the edge.
+- **`matchExceptionType`** includes exception class names in `dropPatterns`
+  matching. It is disabled by default so a broad expression such as `/error/i`
+  does not discard every `TypeError`.
 
 `isNoise(event, opts)` is exported separately if you need the predicate inside
 an existing `beforeSend` (e.g. a Next.js config that already returns `null` for

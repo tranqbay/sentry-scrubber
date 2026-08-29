@@ -46,13 +46,18 @@ function combinePatterns(base, additional) {
     base.flags
   );
 }
-var TECHNICAL_VALUE = /^[A-Za-z0-9_.:/+@<>()#$-]{1,256}$/;
+var TECHNICAL_VALUE = /^(?=.{1,128}$)(?!.*@)(?!\d{7,}$)[A-Za-z0-9_.:/<>()#$-]+$/;
+var PACKAGE_RELEASE = /^(?=.{1,128}$)(?:@[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]+@v?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$/;
 var CODE_LOCATION = /\.(?:c|cc|cpp|cs|go|java|js|jsx|kt|mjs|cjs|php|py|rb|rs|swift|ts|tsx)(?::\d+)?$/i;
 var TRACE_ID = /^[a-f0-9]{16,32}$/i;
 function technicalString(value) {
   if (typeof value !== "string") return void 0;
   const scrubbed = scrubString(value);
   return TECHNICAL_VALUE.test(scrubbed) ? scrubbed : void 0;
+}
+function releaseString(value) {
+  if (typeof value !== "string") return void 0;
+  return technicalString(value) ?? (PACKAGE_RELEASE.test(value) ? value : void 0);
 }
 function codeLocation(value) {
   if (typeof value !== "string") return void 0;
@@ -71,11 +76,12 @@ function strictEvent(event) {
   const safe = copyTechnical(event, [
     "platform",
     "environment",
-    "release",
     "dist",
     "logger",
     "server_name"
   ]);
+  const release = releaseString(event.release);
+  if (release) safe.release = release;
   if (typeof event.event_id === "string" && /^[a-f0-9]{32}$/i.test(event.event_id)) {
     safe.event_id = event.event_id;
   }
@@ -215,18 +221,30 @@ function scrubPII(value, opts, depth = 0) {
 }
 function scrubEvent(event) {
   if (!event || typeof event !== "object") return event;
-  return strictEvent(event);
+  const safe = strictEvent(event);
+  const target = event;
+  try {
+    for (const key of Object.keys(target)) delete target[key];
+    Object.assign(target, safe);
+    const safeKeys = Object.keys(safe);
+    if (Object.keys(target).length !== safeKeys.length || safeKeys.some((key) => target[key] !== safe[key])) {
+      return safe;
+    }
+    return event;
+  } catch {
+    return safe;
+  }
 }
 var phiBeforeSend = (event) => scrubEvent(event);
 var NOISE_LEVELS = /* @__PURE__ */ new Set(["warning", "info", "debug", "log"]);
-function eventText(event) {
+function eventText(event, matchExceptionType = false) {
   const parts = [];
   if (typeof event.message === "string") parts.push(event.message);
   if (event.logentry && typeof event.logentry.message === "string") {
     parts.push(event.logentry.message);
   }
   for (const ex of event.exception?.values ?? []) {
-    if (ex.type) parts.push(ex.type);
+    if (matchExceptionType && ex.type) parts.push(ex.type);
     if (ex.value) parts.push(ex.value);
   }
   return parts.join("\n");
@@ -237,7 +255,7 @@ function isNoise(event, opts) {
     return true;
   }
   if (opts.dropPatterns?.length) {
-    const text = eventText(event);
+    const text = eventText(event, opts.matchExceptionType);
     if (text && opts.dropPatterns.some((re) => {
       re.lastIndex = 0;
       return re.test(text);
