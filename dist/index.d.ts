@@ -44,9 +44,9 @@ interface ScrubOptions {
     additionalKeys?: RegExp;
 }
 declare function scrubPII(value: unknown, opts?: ScrubOptions, depth?: number): unknown;
-declare function scrubEvent<T extends SentryEventLike>(event: T): T;
+declare function scrubEvent<T extends object>(event: T): T;
 /** Drop-in beforeSend for Sentry.init using the default tranqbay PHI key set. */
-declare const phiBeforeSend: <T extends SentryEventLike>(event: T) => T;
+declare const phiBeforeSend: <T extends object>(event: T) => T;
 interface NoiseOptions {
     /**
      * Drop events at or below `warning` severity (warning/info/debug/log).
@@ -77,6 +77,6 @@ declare function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean;
  *     beforeSend: createBeforeSend({ dropWarnings: true }),
  *   });
  */
-declare function createBeforeSend(opts?: NoiseOptions): <T extends SentryEventLike>(event: T) => T | null;
+declare function createBeforeSend(opts?: NoiseOptions): <T extends object>(event: T) => T | null;
 
 export { type NoiseOptions, type ScrubOptions, type SentryEventLike, createBeforeSend, isNoise, phiBeforeSend, scrubEvent, scrubPII };

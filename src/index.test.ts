@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   createBeforeSend,
   isNoise,
@@ -283,6 +283,24 @@ describe('phiBeforeSend', () => {
     };
     expect(phiBeforeSend(event)).toBe(event);
     expect(event).toEqual({ level: 'error', message: '[REDACTED]' });
+  });
+
+  it('preserves an SDK event type without index signatures', () => {
+    interface SdkEvent {
+      type: 'error';
+      request?: { method?: string; data?: unknown };
+      breadcrumbs?: Array<{ message?: string; data?: unknown }>;
+    }
+
+    const event: SdkEvent = {
+      type: 'error',
+      request: { method: 'POST', data: { notes: 'private' } },
+      breadcrumbs: [{ message: 'patient@example.com' }],
+    };
+    const output = phiBeforeSend(event);
+
+    expectTypeOf(output).toEqualTypeOf<SdkEvent>();
+    expect(output).toBe(event);
   });
 });
 
