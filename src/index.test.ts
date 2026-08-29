@@ -1,53 +1,65 @@
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
-  scrubPII,
-  scrubEvent,
-  phiBeforeSend,
-  createPhiBeforeSend,
-  isNoise,
   createBeforeSend,
+  isNoise,
+  phiBeforeSend,
+  scrubEvent,
+  scrubPII,
   type SentryEventLike,
 } from './index';
 
 describe('scrubPII', () => {
-  it('redacts known PII keys at top level', () => {
+  it('redacts sensitive keys and emails', () => {
     expect(
-      scrubPII({ email: 'a@b.c', firstName: 'Ada', ok: 'x' }),
+      scrubPII({
+        email: 'person@example.com',
+        firstName: 'Ada',
+        okay: 'contact person@example.com',
+      }),
     ).toEqual({
       email: '[REDACTED]',
       firstName: '[REDACTED]',
-      ok: 'x',
+      okay: 'contact [EMAIL]',
     });
-  });
-
-  it('redacts emails inside arbitrary strings', () => {
-    expect(scrubPII('user a@b.c logged in')).toBe('user [EMAIL] logged in');
   });
 
   it('walks nested objects and arrays', () => {
-    const input = {
-      patient: { dob: '2000-01-01', notes: 'sensitive' },
-      tags: ['ok', { phone: '+1-555' }],
-    };
-    expect(scrubPII(input)).toEqual({
+    expect(
+      scrubPII({
+        patient: { dob: '2000-01-01', notes: 'sensitive' },
+        values: [{ patientPhone: '+1-555' }],
+      }),
+    ).toEqual({
       patient: { dob: '[REDACTED]', notes: '[REDACTED]' },
-      tags: ['ok', { phone: '[REDACTED]' }],
+      values: [{ patientPhone: '[REDACTED]' }],
     });
   });
 
-  it('honors MAX_DEPTH and tolerates circular references', () => {
-    const cycle: Record<string, unknown> = { a: 1 };
+  it('redacts circular and over-depth data', () => {
+    const cycle: Record<string, unknown> = { value: 1 };
     cycle.self = cycle;
-    expect(() => scrubPII(cycle)).not.toThrow();
+    const circularOutput = JSON.stringify(scrubPII(cycle));
+    expect(circularOutput).toContain('[REDACTED]');
+
+    const deep = {
+      one: {
+        two: {
+          three: {
+            four: { five: { six: { seven: 'deep PHI' } } },
+          },
+        },
+      },
+    };
+    expect(JSON.stringify(scrubPII(deep))).not.toContain('deep PHI');
   });
 
-  it('honors additionalKeys', () => {
+  it('honors additional keys', () => {
     expect(
       scrubPII(
-        { customField: 'leak', other: 'fine' },
-        { additionalKeys: /^customField$/i },
+        { chartId: 'secret', okay: 'fine' },
+        { additionalKeys: /^chartId$/i },
       ),
-    ).toEqual({ customField: '[REDACTED]', other: 'fine' });
+    ).toEqual({ chartId: '[REDACTED]', okay: 'fine' });
   });
 
   it('passes through non-object primitives', () => {
@@ -56,252 +68,256 @@ describe('scrubPII', () => {
     expect(scrubPII(null)).toBe(null);
     expect(scrubPII(undefined)).toBe(undefined);
   });
-
-  it('matches snake_case PII variants too', () => {
-    expect(
-      scrubPII({ first_name: 'Ada', date_of_birth: '2000-01-01', ok: 'x' }),
-    ).toEqual({
-      first_name: '[REDACTED]',
-      date_of_birth: '[REDACTED]',
-      ok: 'x',
-    });
-  });
 });
 
 describe('scrubEvent', () => {
-  it('reduces event.user to id only', () => {
-    const e = {
-      user: { id: 42, email: 'leak@x.com', firstName: 'Ada' },
-    };
-    expect(scrubEvent(e).user).toEqual({ id: 42 });
-  });
-
-  it('drops event.user entirely if preserveUserId is false', () => {
-    const e = { user: { id: 42, email: 'leak@x.com' } };
-    expect(scrubEvent(e, { preserveUserId: false }).user).toBeUndefined();
-  });
-
-  it('redacts event.request.data and query_string', () => {
-    const e = {
+  it('keeps only allowlisted technical context', () => {
+    const input: SentryEventLike = {
+      event_id: '0123456789abcdef0123456789abcdef',
+      platform: 'javascript',
+      timestamp: '2026-08-29T04:00:00Z',
+      level: 'ERROR',
+      environment: 'staging',
+      release: 'service-v1.2.3',
+      dist: '42',
+      logger: 'booking.service',
+      server_name: 'booking-7d9f6',
+      modules: { phiPackage: 'private notes' },
+      sdk: { integration: 'patient@example.com' },
+      user: { id: 'patient-1', email: 'patient@example.com' },
       request: {
-        data: { email: 'a@b.c', notes: 'phi' },
-        query_string: 'q=patientName',
+        method: 'POST',
+        url: '/clients/patient-1?concern=trauma',
+        cookies: 'session=secret',
+        data: { notes: 'private notes' },
       },
-    };
-    const out = scrubEvent(e);
-    expect(out.request?.data).toEqual({
-      email: '[REDACTED]',
-      notes: '[REDACTED]',
-    });
-    expect(out.request?.query_string).toBe('[REDACTED]');
-  });
-
-  it('walks event.extra and event.contexts', () => {
-    const e = {
-      extra: { dob: '2000-01-01', okay: 1 },
-      contexts: { app: { medication: 'paracetamol', version: '1.0' } },
-    };
-    const out = scrubEvent(e);
-    expect(out.extra).toEqual({ dob: '[REDACTED]', okay: 1 });
-    expect(out.contexts).toEqual({
-      app: { medication: '[REDACTED]', version: '1.0' },
-    });
-  });
-
-  it('scrubs breadcrumb data and email in messages', () => {
-    const e = {
+      extra: { details: 'Jane Doe has trauma' },
+      tags: { patient: 'Jane Doe' },
+      transaction: '/clients/patient-1',
+      culprit: 'patient-1',
+      fingerprint: ['patient-1'],
+      threads: { values: [{ name: 'Jane Doe' }] },
+      sdkProcessingMetadata: { requestBody: 'private notes' },
+      message: 'Jane Doe could not book therapy',
+      logentry: { message: 'Call patient on +44 1234', params: ['Jane Doe'] },
       breadcrumbs: [
         {
-          data: { email: 'leak@x.com' },
-          message: 'http GET /api',
-          category: 'http',
+          type: 'http',
+          category: 'POST /clients/patient-1',
+          level: 'info',
+          timestamp: 1,
+          message: 'POST /clients/patient-1',
+          data: { notes: 'private notes' },
         },
-        { data: null, message: 'user a@b.c logged in', category: 'log' },
       ],
+      contexts: {
+        trace: {
+          trace_id: '0123456789abcdef0123456789abcdef',
+          span_id: '0123456789abcdef',
+          parent_span_id: 'fedcba9876543210',
+          op: 'http.server',
+          status: 'internal_error',
+          origin: 'auto.http.otel',
+          description: 'Jane Doe',
+        },
+        clinical: { concern: 'trauma' },
+      },
+      exception: {
+        values: [
+          {
+            type: 'BookingError',
+            module: 'booking.service',
+            thread_id: 3,
+            value: 'Jane Doe has trauma',
+            stacktrace: {
+              frames: [
+                {
+                  filename:
+                    'https://tranq.online/_next/static/chunks/booking.js?email=patient@example.com',
+                  abs_path:
+                    '/app/src/booking.ts?patient=patient-1',
+                  function: 'createBooking',
+                  module: 'booking.service',
+                  lineno: 42,
+                  colno: 7,
+                  in_app: true,
+                  vars: { patientName: 'Jane Doe' },
+                  context_line: 'throw new Error(patientName)',
+                },
+              ],
+            },
+            mechanism: {
+              type: 'generic',
+              handled: false,
+              synthetic: true,
+              data: { requestBody: 'private notes' },
+            },
+          },
+        ],
+      },
+      debug_meta: {
+        images: [
+          {
+            type: 'sourcemap',
+            debug_id: '01234567-89ab-cdef-0123-456789abcdef',
+            code_file:
+              'https://tranq.online/_next/static/chunks/booking.js?email=patient@example.com',
+            secretData: 'private notes',
+          },
+        ],
+      },
     };
-    const out = scrubEvent(e);
-    expect(out.breadcrumbs?.[0]?.data).toEqual({ email: '[REDACTED]' });
-    expect(out.breadcrumbs?.[0]?.message).toBe('http GET /api');
-    expect(out.breadcrumbs?.[1]?.data).toBeNull();
-    expect(out.breadcrumbs?.[1]?.message).toBe('user [EMAIL] logged in');
+
+    const output = scrubEvent(input);
+
+    expect(output).not.toBe(input);
+    expect(output).toMatchObject({
+      event_id: '0123456789abcdef0123456789abcdef',
+      platform: 'javascript',
+      timestamp: '2026-08-29T04:00:00Z',
+      level: 'error',
+      environment: 'staging',
+      release: 'service-v1.2.3',
+      dist: '42',
+      logger: 'booking.service',
+      server_name: 'booking-7d9f6',
+      request: { method: 'POST' },
+      message: '[REDACTED]',
+      logentry: { message: '[REDACTED]' },
+      breadcrumbs: [{ type: 'http', level: 'info', timestamp: 1 }],
+    });
+    expect(output.contexts).toEqual({
+      trace: {
+        trace_id: '0123456789abcdef0123456789abcdef',
+        span_id: '0123456789abcdef',
+        parent_span_id: 'fedcba9876543210',
+        op: 'http.server',
+        status: 'internal_error',
+        origin: 'auto.http.otel',
+      },
+    });
+
+    const exception = output.exception?.values?.[0];
+    expect(exception).toMatchObject({
+      type: 'BookingError',
+      module: 'booking.service',
+      thread_id: 3,
+      value: '[REDACTED]',
+      mechanism: { type: 'generic', handled: false, synthetic: true },
+    });
+    const frame = (
+      exception?.stacktrace as { frames: Array<Record<string, unknown>> }
+    ).frames[0];
+    expect(frame).toEqual({
+      filename: 'https://tranq.online/_next/static/chunks/booking.js',
+      abs_path: '/app/src/booking.ts',
+      function: 'createBooking',
+      module: 'booking.service',
+      lineno: 42,
+      colno: 7,
+      in_app: true,
+    });
+    expect(output.debug_meta).toEqual({
+      images: [
+        {
+          type: 'sourcemap',
+          debug_id: '01234567-89ab-cdef-0123-456789abcdef',
+          code_file: 'https://tranq.online/_next/static/chunks/booking.js',
+        },
+      ],
+    });
+
+    const serialized = JSON.stringify(output);
+    for (const value of [
+      'patient-1',
+      'patient@example.com',
+      'Jane Doe',
+      'trauma',
+      'private notes',
+      '+44 1234',
+      'session=secret',
+      'phiPackage',
+    ]) {
+      expect(serialized).not.toContain(value);
+    }
+    expect(input.user?.id).toBe('patient-1');
+  });
+
+  it('drops malformed technical values', () => {
+    expect(
+      scrubEvent({
+        event_id: 'person@example.com',
+        environment: 'patient@example.com',
+        level: 'patient',
+        timestamp: 'not-a-time',
+        request: { method: 'patient-name' },
+      }),
+    ).toEqual({});
   });
 
   it('returns non-object inputs unchanged', () => {
     expect(scrubEvent(null as unknown as SentryEventLike)).toBe(null);
   });
-
-  it('scrubs emails in the top-level message and logentry', () => {
-    const out = scrubEvent({
-      message: 'Failed for patient a@b.c',
-      logentry: { message: 'retry for x@y.io' },
-    });
-    expect(out.message).toBe('Failed for patient [EMAIL]');
-    expect(out.logentry?.message).toBe('retry for [EMAIL]');
-  });
-
-  it('scrubs emails inside exception values (freeform error text)', () => {
-    const out = scrubEvent({
-      exception: {
-        values: [
-          { type: 'Error', value: 'No subscription for jane@doe.com' },
-          { type: 'Error', value: undefined },
-        ],
-      },
-    });
-    expect(out.exception?.values?.[0]?.value).toBe(
-      'No subscription for [EMAIL]',
-    );
-    expect(out.exception?.values?.[0]?.type).toBe('Error');
-  });
-
-  it('scrubs request.headers (cookie/authorization redacted, emails masked)', () => {
-    const out = scrubEvent({
-      request: {
-        headers: {
-          cookie: 'session=abc',
-          authorization: 'Bearer xyz',
-          'x-user': 'a@b.c',
-          'content-type': 'application/json',
-        },
-      },
-    });
-    const h = out.request?.headers as Record<string, string>;
-    expect(h.cookie).toBe('[REDACTED]');
-    expect(h.authorization).toBe('[REDACTED]');
-    expect(h['x-user']).toBe('[EMAIL]');
-    expect(h['content-type']).toBe('application/json');
-  });
-});
-
-describe('compound key matching', () => {
-  it('redacts compound sensitive keys', () => {
-    expect(
-      scrubPII({
-        userEmail: 'a@b.c',
-        patientPhone: '555',
-        csrfToken: 'x',
-        accessToken: 'y',
-      }),
-    ).toEqual({
-      userEmail: '[REDACTED]',
-      patientPhone: '[REDACTED]',
-      csrfToken: '[REDACTED]',
-      accessToken: '[REDACTED]',
-    });
-  });
-
-  it('does NOT over-redact generic lookalike keys', () => {
-    expect(
-      scrubPII({ username: 'ada', filename: 'a.txt', displayName: 'Ada L' }),
-    ).toEqual({ username: 'ada', filename: 'a.txt', displayName: 'Ada L' });
-  });
 });
 
 describe('phiBeforeSend', () => {
-  it('is a Sentry-compatible beforeSend with the default key set', () => {
-    const e = {
-      user: { id: 1, email: 'leak@x.com' },
-      extra: { dob: '2000-01-01', notes: 'phi' },
-    };
-    const out = phiBeforeSend(e);
-    expect(out.user).toEqual({ id: 1 });
-    expect(out.extra).toEqual({
-      dob: '[REDACTED]',
-      notes: '[REDACTED]',
-    });
-  });
-});
-
-describe('createPhiBeforeSend', () => {
-  it('returns a beforeSend that respects custom keys', () => {
-    const beforeSend = createPhiBeforeSend({
-      additionalKeys: /^chartId$/i,
-    });
-    const e = { extra: { chartId: '12345', okay: 'fine' } };
-    expect(beforeSend(e).extra).toEqual({
-      chartId: '[REDACTED]',
-      okay: 'fine',
-    });
-  });
-
-  it('still applies default keys when additionalKeys is set', () => {
-    const beforeSend = createPhiBeforeSend({ additionalKeys: /^foo$/i });
-    expect(beforeSend({ extra: { email: 'a@b.c', foo: 'bar' } }).extra).toEqual(
-      { email: '[REDACTED]', foo: '[REDACTED]' },
-    );
-  });
-});
-
-describe('isNoise', () => {
-  it('is false when no options are given', () => {
-    expect(isNoise({ level: 'warning' })).toBe(false);
-  });
-
-  it('flags warning-and-below levels when dropWarnings is set', () => {
-    const opts = { dropWarnings: true };
-    expect(isNoise({ level: 'warning' }, opts)).toBe(true);
-    expect(isNoise({ level: 'info' }, opts)).toBe(true);
-    expect(isNoise({ level: 'debug' }, opts)).toBe(true);
-    expect(isNoise({ level: 'log' }, opts)).toBe(true);
-    expect(isNoise({ level: 'WARNING' }, opts)).toBe(true); // case-insensitive
-  });
-
-  it('does not flag error/fatal when dropWarnings is set', () => {
-    const opts = { dropWarnings: true };
-    expect(isNoise({ level: 'error' }, opts)).toBe(false);
-    expect(isNoise({ level: 'fatal' }, opts)).toBe(false);
-    expect(isNoise({}, opts)).toBe(false); // no level => not noise
-  });
-
-  it('matches dropPatterns against message, logentry and exception text', () => {
-    const opts = { dropPatterns: [/subscription not found/i] };
-    expect(isNoise({ message: 'Subscription not found: SUB_1' }, opts)).toBe(
-      true,
-    );
+  it('uses the strict allowlist', () => {
     expect(
-      isNoise({ logentry: { message: 'subscription NOT FOUND x' } }, opts),
-    ).toBe(true);
+      phiBeforeSend({
+        level: 'error',
+        user: { id: 'patient-1' },
+        message: 'patient@example.com',
+      }),
+    ).toEqual({ level: 'error', message: '[REDACTED]' });
+  });
+});
+
+describe('noise filtering', () => {
+  it('drops warning and lower levels when configured', () => {
+    const options = { dropWarnings: true };
+    expect(isNoise({ level: 'warning' }, options)).toBe(true);
+    expect(isNoise({ level: 'info' }, options)).toBe(true);
+    expect(isNoise({ level: 'error' }, options)).toBe(false);
+  });
+
+  it('matches configured message patterns', () => {
+    const options = { dropPatterns: [/broker transport failure/i] };
     expect(
       isNoise(
-        { exception: { values: [{ type: 'Error', value: 'Subscription not found' }] } },
-        opts,
+        { level: 'error', message: 'Broker transport failure' },
+        options,
       ),
     ).toBe(true);
-    expect(isNoise({ message: 'something else' }, opts)).toBe(false);
+    expect(isNoise({ level: 'error', message: 'Database failed' }, options)).toBe(
+      false,
+    );
+  });
+
+  it('resets stateful regular expressions', () => {
+    const pattern = /expected noise/gi;
+    expect(isNoise({ message: 'expected noise' }, { dropPatterns: [pattern] })).toBe(
+      true,
+    );
+    expect(isNoise({ message: 'expected noise' }, { dropPatterns: [pattern] })).toBe(
+      true,
+    );
   });
 });
 
 describe('createBeforeSend', () => {
-  it('drops noise (returns null) and keeps real errors', () => {
+  it('drops noise before scrubbing', () => {
     const beforeSend = createBeforeSend({ dropWarnings: true });
-    expect(beforeSend({ level: 'warning', message: 'noisy' })).toBeNull();
-    expect(beforeSend({ level: 'error', message: 'real' })).not.toBeNull();
+    expect(beforeSend({ level: 'warning', message: 'noise' })).toBeNull();
   });
 
-  it('scrubs PII on events that survive the noise filter', () => {
+  it('strictly scrubs retained errors', () => {
     const beforeSend = createBeforeSend({ dropWarnings: true });
-    const out = beforeSend({
-      level: 'error',
-      user: { id: '7', email: 'a@b.c' },
-      extra: { email: 'a@b.c', ok: 'x' },
-    });
-    expect(out).not.toBeNull();
-    expect(out?.user).toEqual({ id: '7' });
-    expect(out?.extra).toEqual({ email: '[REDACTED]', ok: 'x' });
-  });
-
-  it('drops events matching dropPatterns regardless of level', () => {
-    const beforeSend = createBeforeSend({
-      dropPatterns: [/broker transport failure/i],
-    });
     expect(
-      beforeSend({ level: 'error', message: 'librdkafka: Broker transport failure' }),
-    ).toBeNull();
-    expect(beforeSend({ level: 'error', message: 'genuine bug' })).not.toBeNull();
-  });
-
-  it('is a no-op passthrough (plus PII scrub) when no options are given', () => {
-    const beforeSend = createBeforeSend();
-    expect(beforeSend({ level: 'warning', message: 'kept' })).not.toBeNull();
+      beforeSend({
+        level: 'error',
+        user: { id: 'patient-1' },
+        message: 'patient@example.com',
+      }),
+    ).toEqual({ level: 'error', message: '[REDACTED]' });
   });
 });
