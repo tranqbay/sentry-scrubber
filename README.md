@@ -15,7 +15,7 @@ In your service's `package.json`:
 ```json
 {
   "optionalDependencies": {
-    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v1.1.0"
+    "@tranqbay/sentry-scrubber": "github:tranqbay/sentry-scrubber#v1.2.0"
   }
 }
 ```
@@ -98,16 +98,66 @@ Same pattern in `sentry.server.config.ts` and `sentry.edge.config.ts`.
 
 The default is strict and fail closed:
 
-- `event.user`, `event.extra`, non-trace contexts, `event.tags`, `event.transaction`, `event.culprit`, and `event.fingerprint` are removed
+- `event.user`, `event.extra`, non-trace contexts, `event.transaction`, and `event.culprit` are removed
 - `event.request` retains only the HTTP method
-- breadcrumbs retain only type, level, and timestamp
-- freeform messages and exception values become `[REDACTED]`
+- breadcrumbs retain type, level, timestamp and a known category; request and navigation breadcrumbs also keep `data.method`, `data.status_code` and a normalized `data.route` (never `data.url`)
+- freeform messages and exception values become `[REDACTED]`, unless the whole value is a known technical message (see below)
+- `event.tags` and `event.fingerprint` are removed except for the safe technical context below
 - safe code locations, stack structure, trace IDs, and source-map debug IDs remain
 - frame variables, code context, mechanism data, and unknown fields are removed
 - recursive utility calls replace data beyond the depth limit with `[REDACTED]`
 
 There is no permissive event mode in version 1.
 Technical names such as exception type, logger, and release are retained for grouping. Keep them code-defined and never interpolate patient identifiers into them.
+
+## Safe technical context (1.2.0)
+
+An event that only says `[REDACTED]` cannot be acted on. Version 1.2.0 keeps a
+small set of validated technical facts so an error says what failed:
+
+| Tag | Kept when |
+|---|---|
+| `http.method` | `GET`, `POST`, ... |
+| `http.status_code` | three digits |
+| `error.code` | an error code shape (`ERR_NETWORK`, `ECONNABORTED`, `UND_ERR_*`) |
+| `http.route` | always re-normalized with `normalizeRoute` |
+| `runtime` | `browser`, `ssr` or `server` |
+| `http.host` | listed in `allowedHosts` |
+
+Any other tag is dropped. A `fingerprint` is kept only when every element is
+`{{ default }}`, an exception type, or one of the kept tag values.
+
+Messages are kept only when the whole value is a known technical message such
+as `Request failed with status code 524`, `Network Error`,
+`timeout of 1500ms exceeded` or `Failed to fetch`. React's minified and
+hydration errors are cut to their fixed prefix.
+
+`normalizeRoute(url, words)` strips scheme, host, query and fragment and turns
+every segment not in `words` into `:param`. With no words every segment becomes
+`:param`.
+
+```typescript
+import { createBeforeSend, normalizeRoute } from '@tranqbay/sentry-scrubber';
+
+const routeWords = ['booking', 'metrics', 'providers'];
+
+Sentry.init({
+  beforeSend: createBeforeSend({
+    dropWarnings: true,
+    allowedHosts: ['api.example.com'],
+    routeWords,
+  }),
+});
+
+Sentry.captureException(error, {
+  tags: {
+    'http.method': 'GET',
+    'http.status_code': '524',
+    'http.route': normalizeRoute(requestUrl, routeWords),
+    runtime: 'ssr',
+  },
+});
+```
 
 ## Recursive utility
 

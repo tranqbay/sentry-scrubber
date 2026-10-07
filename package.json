@@ -1,6 +1,6 @@
 {
   "name": "@tranqbay/sentry-scrubber",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Sentry/Glitchtip beforeSend PII scrubber for tranqbay services",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

@@ -39,12 +39,24 @@ type SentryEventLike = {
     };
     [k: string]: unknown;
 };
+interface StrictOptions {
+    /** API hosts that may be reported in the `http.host` tag (exact match). */
+    allowedHosts?: string[];
+    /** Static path words kept by `normalizeRoute`; every other segment becomes `:param`. */
+    routeWords?: Iterable<string>;
+}
 interface ScrubOptions {
     /** Additional regex of object key names to redact, OR'd with the default set. */
     additionalKeys?: RegExp;
 }
+/**
+ * Reduce a URL or path to a route template. Segments not in `words` become
+ * `:param`, so ids, slugs and search text never survive. Fails closed when no
+ * words are given.
+ */
+declare function normalizeRoute(path: string, words?: Iterable<string>): string;
 declare function scrubPII(value: unknown, opts?: ScrubOptions, depth?: number): unknown;
-declare function scrubEvent<T extends object>(event: T): T;
+declare function scrubEvent<T extends object>(event: T, opts?: StrictOptions): T;
 /** Drop-in beforeSend for Sentry.init using the default tranqbay PHI key set. */
 declare const phiBeforeSend: <T extends object>(event: T) => T;
 interface NoiseOptions {
@@ -77,6 +89,6 @@ declare function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean;
  *     beforeSend: createBeforeSend({ dropWarnings: true }),
  *   });
  */
-declare function createBeforeSend(opts?: NoiseOptions): <T extends object>(event: T) => T | null;
+declare function createBeforeSend(opts?: NoiseOptions & StrictOptions): <T extends object>(event: T) => T | null;
 
-export { type NoiseOptions, type ScrubOptions, type SentryEventLike, createBeforeSend, isNoise, phiBeforeSend, scrubEvent, scrubPII };
+export { type NoiseOptions, type ScrubOptions, type SentryEventLike, type StrictOptions, createBeforeSend, isNoise, normalizeRoute, phiBeforeSend, scrubEvent, scrubPII };

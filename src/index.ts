@@ -34,6 +34,13 @@ export type SentryEventLike = {
   [k: string]: unknown;
 };
 
+export interface StrictOptions {
+  /** API hosts that may be reported in the `http.host` tag (exact match). */
+  allowedHosts?: string[];
+  /** Static path words kept by `normalizeRoute`; every other segment becomes `:param`. */
+  routeWords?: Iterable<string>;
+}
+
 export interface ScrubOptions {
   /** Additional regex of object key names to redact, OR'd with the default set. */
   additionalKeys?: RegExp;
@@ -105,7 +112,106 @@ function copyTechnical(
   return output;
 }
 
-function strictEvent(event: SentryEventLike): SentryEventLike {
+
+const ROUTE_WORD = /^[a-z][a-z0-9-]{0,39}$/;
+const ROUTE = /^\/(?:(?:[a-z][a-z0-9-]{0,39}|:param)(?:\/(?:[a-z][a-z0-9-]{0,39}|:param))*)?$/;
+const PARAM = ':param';
+
+/**
+ * Reduce a URL or path to a route template. Segments not in `words` become
+ * `:param`, so ids, slugs and search text never survive. Fails closed when no
+ * words are given.
+ */
+export function normalizeRoute(path: string, words?: Iterable<string>): string {
+  const allowed = new Set(words ?? []);
+  const withoutOrigin = String(path).replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '');
+  const pathname = withoutOrigin.split(/[?#]/, 1)[0];
+  const segments = pathname
+    .split('/')
+    .filter((segment) => segment !== '')
+    .map((segment) =>
+      ROUTE_WORD.test(segment) && allowed.has(segment) ? segment : PARAM,
+    );
+  return `/${segments.join('/')}`.slice(0, 256);
+}
+
+function safeRoute(value: unknown, opts?: StrictOptions): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const route = normalizeRoute(value, opts?.routeWords);
+  return ROUTE.test(route) ? route : undefined;
+}
+
+const TAG_RULES: Record<string, (value: string, opts?: StrictOptions) => string | undefined> = {
+  'http.method': (value) => (/^[A-Z]{3,10}$/.test(value) ? value : undefined),
+  'http.status_code': (value) => (/^\d{3}$/.test(value) ? value : undefined),
+  'error.code': (value) =>
+    /^(?:ERR_[A-Z_]{2,40}|UND_ERR_[A-Z_]{2,30}|EAI_[A-Z]{2,10}|E[A-Z]{3,15})$/.test(value)
+      ? value
+      : undefined,
+  'http.route': (value, opts) => safeRoute(value, opts),
+  runtime: (value) => (['browser', 'ssr', 'server'].includes(value) ? value : undefined),
+  'http.host': (value, opts) =>
+    opts?.allowedHosts?.includes(value.toLowerCase()) ? value.toLowerCase() : undefined,
+};
+
+function safeTags(tags: unknown, opts?: StrictOptions): Record<string, string> | undefined {
+  if (!tags || typeof tags !== 'object' || Array.isArray(tags)) return undefined;
+  const output: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(tags as Record<string, unknown>)) {
+    const rule = TAG_RULES[key];
+    if (!rule || (typeof raw !== 'string' && typeof raw !== 'number')) continue;
+    const value = rule(String(raw), opts);
+    if (value !== undefined) output[key] = value;
+  }
+  return Object.keys(output).length ? output : undefined;
+}
+
+const SAFE_MESSAGES: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
+  [/^Request failed with status code \d{3}$/, (m) => m[0]],
+  [/^Network Error$/, (m) => m[0]],
+  [/^timeout of \d{1,7}ms exceeded$/, (m) => m[0]],
+  [/^timeout exceeded$/, (m) => m[0]],
+  [/^Request aborted$/, (m) => m[0]],
+  [/^canceled$/, (m) => m[0]],
+  [/^Failed to fetch$/, (m) => m[0]],
+  [/^Load failed$/, (m) => m[0]],
+  [/^NetworkError when attempting to fetch resource\.$/, (m) => m[0]],
+  [/^The operation was aborted\.?$/, (m) => m[0]],
+  [/^signal is aborted without reason$/, (m) => m[0]],
+  [/^Script error\.?$/, (m) => m[0]],
+  [/^ResizeObserver loop (?:completed with undelivered notifications|limit exceeded)\.?$/, (m) => m[0]],
+  [/^Loading (?:CSS )?chunk \d{1,10} failed\.?$/, (m) => m[0]],
+  [/^Minified React error #(\d{1,5})(?:[;.\s]|$)/, (m) => `Minified React error #${m[1]}`],
+  [
+    /^Hydration failed because the server rendered HTML didn't match the client\./,
+    (m) => m[0],
+  ],
+];
+
+function safeMessage(value: unknown): string {
+  if (typeof value === 'string') {
+    for (const [pattern, keep] of SAFE_MESSAGES) {
+      const match = value.match(pattern);
+      if (match) return keep(match);
+    }
+  }
+  return REDACTED;
+}
+
+const BREADCRUMB_CATEGORIES = new Set([
+  'xhr',
+  'fetch',
+  'navigation',
+  'http',
+  'console',
+  'ui.click',
+  'ui.input',
+  'sentry.event',
+  'sentry.transaction',
+]);
+const REQUEST_CATEGORIES = new Set(['xhr', 'fetch', 'http']);
+
+function strictEvent(event: SentryEventLike, opts?: StrictOptions): SentryEventLike {
   const safe = copyTechnical(event, [
     'platform',
     'environment',
@@ -153,12 +259,38 @@ function strictEvent(event: SentryEventLike): SentryEventLike {
       if (typeof breadcrumb.timestamp === 'number') {
         output.timestamp = breadcrumb.timestamp;
       }
+      const category =
+        typeof breadcrumb.category === 'string' &&
+        BREADCRUMB_CATEGORIES.has(breadcrumb.category)
+          ? breadcrumb.category
+          : undefined;
+      if (category) output.category = category;
+      const data = breadcrumb.data as Record<string, unknown> | undefined;
+      if (data && typeof data === 'object' && (category === 'navigation' || REQUEST_CATEGORIES.has(category ?? ''))) {
+        const safeData: Record<string, unknown> = {};
+        if (REQUEST_CATEGORIES.has(category ?? '')) {
+          if (typeof data.method === 'string' && /^[A-Z]{3,10}$/.test(data.method)) {
+            safeData.method = data.method;
+          }
+          if (typeof data.status_code === 'number' && Number.isInteger(data.status_code) && data.status_code >= 100 && data.status_code <= 599) {
+            safeData.status_code = data.status_code;
+          }
+        }
+        const route = safeRoute(data.route, opts);
+        if (route) safeData.route = route;
+        if (Object.keys(safeData).length) output.data = safeData;
+      }
       return output;
     });
   }
 
-  if (event.message !== undefined) safe.message = REDACTED;
-  if (event.logentry !== undefined) safe.logentry = { message: REDACTED };
+  if (event.message !== undefined) safe.message = safeMessage(event.message);
+  if (event.logentry !== undefined) {
+    safe.logentry = { message: safeMessage(event.logentry.message) };
+  }
+
+  const tags = safeTags(event.tags, opts);
+  if (tags) safe.tags = tags;
 
   if (event.exception?.values) {
     safe.exception = {
@@ -174,7 +306,7 @@ function strictEvent(event: SentryEventLike): SentryEventLike {
         ) {
           output.thread_id = exception.thread_id;
         }
-        if (exception.value !== undefined) output.value = REDACTED;
+        if (exception.value !== undefined) output.value = safeMessage(exception.value);
 
         const stacktrace = exception.stacktrace as
           | { frames?: Array<Record<string, unknown>> }
@@ -263,6 +395,16 @@ function strictEvent(event: SentryEventLike): SentryEventLike {
     };
   }
 
+  if (Array.isArray(event.fingerprint) && event.fingerprint.length) {
+    const known = new Set<string>(['{{ default }}', ...Object.values(tags ?? {})]);
+    for (const exception of (safe.exception?.values ?? [])) {
+      if (typeof exception.type === 'string') known.add(exception.type);
+    }
+    if (event.fingerprint.every((part) => typeof part === 'string' && known.has(part))) {
+      safe.fingerprint = [...event.fingerprint];
+    }
+  }
+
   return safe;
 }
 
@@ -290,9 +432,9 @@ export function scrubPII(
   return value;
 }
 
-export function scrubEvent<T extends object>(event: T): T {
+export function scrubEvent<T extends object>(event: T, opts?: StrictOptions): T {
   if (!event || typeof event !== 'object') return event;
-  const safe = strictEvent(event as unknown as SentryEventLike) as unknown as T;
+  const safe = strictEvent(event as unknown as SentryEventLike, opts) as unknown as T;
   const target = event as unknown as Record<string, unknown>;
   const safeRecord = safe as unknown as Record<string, unknown>;
   try {
@@ -387,9 +529,9 @@ export function isNoise(event: SentryEventLike, opts?: NoiseOptions): boolean {
  *     beforeSend: createBeforeSend({ dropWarnings: true }),
  *   });
  */
-export function createBeforeSend(opts?: NoiseOptions) {
+export function createBeforeSend(opts?: NoiseOptions & StrictOptions) {
   return <T extends object>(event: T): T | null => {
     if (isNoise(event as unknown as SentryEventLike, opts)) return null;
-    return scrubEvent(event);
+    return scrubEvent(event, opts);
   };
 }
