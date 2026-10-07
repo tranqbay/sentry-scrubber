@@ -44,7 +44,85 @@ function copyTechnical(source, fields) {
   }
   return output;
 }
-function strictEvent(event) {
+var ROUTE_WORD = /^[a-z][a-z0-9-]{0,39}$/;
+var ROUTE = /^\/(?:(?:[a-z][a-z0-9-]{0,39}|:param)(?:\/(?:[a-z][a-z0-9-]{0,39}|:param))*)?$/;
+var PARAM = ":param";
+function normalizeRoute(path, words) {
+  const allowed = new Set(words ?? []);
+  const withoutOrigin = String(path).replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, "");
+  const pathname = withoutOrigin.split(/[?#]/, 1)[0];
+  const segments = pathname.split("/").filter((segment) => segment !== "").map(
+    (segment) => ROUTE_WORD.test(segment) && allowed.has(segment) ? segment : PARAM
+  );
+  return `/${segments.join("/")}`.slice(0, 256);
+}
+function safeRoute(value, opts) {
+  if (typeof value !== "string") return void 0;
+  const route = normalizeRoute(value, opts?.routeWords);
+  return ROUTE.test(route) ? route : void 0;
+}
+var TAG_RULES = {
+  "http.method": (value) => /^[A-Z]{3,10}$/.test(value) ? value : void 0,
+  "http.status_code": (value) => /^\d{3}$/.test(value) ? value : void 0,
+  "error.code": (value) => /^(?:ERR_[A-Z_]{2,40}|UND_ERR_[A-Z_]{2,30}|EAI_[A-Z]{2,10}|E[A-Z]{3,15})$/.test(value) ? value : void 0,
+  "http.route": (value, opts) => safeRoute(value, opts),
+  runtime: (value) => ["browser", "ssr", "server"].includes(value) ? value : void 0,
+  "http.host": (value, opts) => opts?.allowedHosts?.includes(value.toLowerCase()) ? value.toLowerCase() : void 0
+};
+function safeTags(tags, opts) {
+  if (!tags || typeof tags !== "object" || Array.isArray(tags)) return void 0;
+  const output = {};
+  for (const [key, raw] of Object.entries(tags)) {
+    const rule = TAG_RULES[key];
+    if (!rule || typeof raw !== "string" && typeof raw !== "number") continue;
+    const value = rule(String(raw), opts);
+    if (value !== void 0) output[key] = value;
+  }
+  return Object.keys(output).length ? output : void 0;
+}
+var SAFE_MESSAGES = [
+  [/^Request failed with status code \d{3}$/, (m) => m[0]],
+  [/^Network Error$/, (m) => m[0]],
+  [/^timeout of \d{1,7}ms exceeded$/, (m) => m[0]],
+  [/^timeout exceeded$/, (m) => m[0]],
+  [/^Request aborted$/, (m) => m[0]],
+  [/^canceled$/, (m) => m[0]],
+  [/^Failed to fetch$/, (m) => m[0]],
+  [/^Load failed$/, (m) => m[0]],
+  [/^NetworkError when attempting to fetch resource\.$/, (m) => m[0]],
+  [/^The operation was aborted\.?$/, (m) => m[0]],
+  [/^signal is aborted without reason$/, (m) => m[0]],
+  [/^Script error\.?$/, (m) => m[0]],
+  [/^ResizeObserver loop (?:completed with undelivered notifications|limit exceeded)\.?$/, (m) => m[0]],
+  [/^Loading (?:CSS )?chunk \d{1,10} failed\.?$/, (m) => m[0]],
+  [/^Minified React error #(\d{1,5})(?:[;.\s]|$)/, (m) => `Minified React error #${m[1]}`],
+  [
+    /^Hydration failed because the server rendered HTML didn't match the client\./,
+    (m) => m[0]
+  ]
+];
+function safeMessage(value) {
+  if (typeof value === "string") {
+    for (const [pattern, keep] of SAFE_MESSAGES) {
+      const match = value.match(pattern);
+      if (match) return keep(match);
+    }
+  }
+  return REDACTED;
+}
+var BREADCRUMB_CATEGORIES = /* @__PURE__ */ new Set([
+  "xhr",
+  "fetch",
+  "navigation",
+  "http",
+  "console",
+  "ui.click",
+  "ui.input",
+  "sentry.event",
+  "sentry.transaction"
+]);
+var REQUEST_CATEGORIES = /* @__PURE__ */ new Set(["xhr", "fetch", "http"]);
+function strictEvent(event, opts) {
   const safe = copyTechnical(event, [
     "platform",
     "environment",
@@ -78,11 +156,32 @@ function strictEvent(event) {
       if (typeof breadcrumb.timestamp === "number") {
         output.timestamp = breadcrumb.timestamp;
       }
+      const category = typeof breadcrumb.category === "string" && BREADCRUMB_CATEGORIES.has(breadcrumb.category) ? breadcrumb.category : void 0;
+      if (category) output.category = category;
+      const data = breadcrumb.data;
+      if (data && typeof data === "object" && (category === "navigation" || REQUEST_CATEGORIES.has(category ?? ""))) {
+        const safeData = {};
+        if (REQUEST_CATEGORIES.has(category ?? "")) {
+          if (typeof data.method === "string" && /^[A-Z]{3,10}$/.test(data.method)) {
+            safeData.method = data.method;
+          }
+          if (typeof data.status_code === "number" && Number.isInteger(data.status_code) && data.status_code >= 100 && data.status_code <= 599) {
+            safeData.status_code = data.status_code;
+          }
+        }
+        const route = safeRoute(data.route, opts);
+        if (route) safeData.route = route;
+        if (Object.keys(safeData).length) output.data = safeData;
+      }
       return output;
     });
   }
-  if (event.message !== void 0) safe.message = REDACTED;
-  if (event.logentry !== void 0) safe.logentry = { message: REDACTED };
+  if (event.message !== void 0) safe.message = safeMessage(event.message);
+  if (event.logentry !== void 0) {
+    safe.logentry = { message: safeMessage(event.logentry.message) };
+  }
+  const tags = safeTags(event.tags, opts);
+  if (tags) safe.tags = tags;
   if (event.exception?.values) {
     safe.exception = {
       values: event.exception.values.map((exception) => {
@@ -93,7 +192,7 @@ function strictEvent(event) {
         if (typeof exception.thread_id === "number" || typeof exception.thread_id === "string" && /^[a-f0-9-]{1,64}$/i.test(exception.thread_id)) {
           output.thread_id = exception.thread_id;
         }
-        if (exception.value !== void 0) output.value = REDACTED;
+        if (exception.value !== void 0) output.value = safeMessage(exception.value);
         const stacktrace = exception.stacktrace;
         if (stacktrace?.frames) {
           output.stacktrace = {
@@ -170,6 +269,15 @@ function strictEvent(event) {
       })
     };
   }
+  if (Array.isArray(event.fingerprint) && event.fingerprint.length) {
+    const known = /* @__PURE__ */ new Set(["{{ default }}", ...Object.values(tags ?? {})]);
+    for (const exception of safe.exception?.values ?? []) {
+      if (typeof exception.type === "string") known.add(exception.type);
+    }
+    if (event.fingerprint.every((part) => typeof part === "string" && known.has(part))) {
+      safe.fingerprint = [...event.fingerprint];
+    }
+  }
   return safe;
 }
 function scrubPII(value, opts, depth = 0) {
@@ -191,9 +299,9 @@ function scrubPII(value, opts, depth = 0) {
   }
   return value;
 }
-function scrubEvent(event) {
+function scrubEvent(event, opts) {
   if (!event || typeof event !== "object") return event;
-  const safe = strictEvent(event);
+  const safe = strictEvent(event, opts);
   const target = event;
   const safeRecord = safe;
   try {
@@ -241,12 +349,13 @@ function isNoise(event, opts) {
 function createBeforeSend(opts) {
   return (event) => {
     if (isNoise(event, opts)) return null;
-    return scrubEvent(event);
+    return scrubEvent(event, opts);
   };
 }
 export {
   createBeforeSend,
   isNoise,
+  normalizeRoute,
   phiBeforeSend,
   scrubEvent,
   scrubPII

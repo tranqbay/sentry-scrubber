@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   createBeforeSend,
   isNoise,
+  normalizeRoute,
   phiBeforeSend,
   scrubEvent,
   scrubPII,
@@ -373,5 +374,252 @@ describe('createBeforeSend', () => {
         message: 'patient@example.com',
       }),
     ).toEqual({ level: 'error', message: '[REDACTED]' });
+  });
+});
+
+describe('normalizeRoute', () => {
+  const words = ['booking', 'metrics', 'region', 'cities', 'providers', 'best-match', 'v2', 'query'];
+
+  it('keeps allowlisted words and replaces everything else', () => {
+    expect(normalizeRoute('/booking/metrics', words)).toBe('/booking/metrics');
+    expect(normalizeRoute('/region/cities/01ARZ3NDEKTSV4RRFFQ69G5FAV', words)).toBe('/region/cities/:param');
+    expect(normalizeRoute('/providers/jane-doe', words)).toBe('/providers/:param');
+    expect(normalizeRoute('/query/v2/providers/best-match', words)).toBe('/query/v2/providers/best-match');
+    expect(normalizeRoute('/providers/123/booking', words)).toBe('/providers/:param/booking');
+  });
+
+  it('strips scheme, host, query and fragment', () => {
+    expect(
+      normalizeRoute('https://api.example.test/booking/metrics?email=a@b.co#x', words),
+    ).toBe('/booking/metrics');
+    expect(normalizeRoute('booking?concern=trauma', words)).toBe('/booking');
+  });
+
+  it('fails closed without an allowlist', () => {
+    expect(normalizeRoute('/booking/metrics')).toBe('/:param/:param');
+    expect(normalizeRoute('/', words)).toBe('/');
+    expect(normalizeRoute('', words)).toBe('/');
+  });
+
+  it('does not let uppercase or encoded text through', () => {
+    expect(normalizeRoute('/Booking/Jane%20Doe', words)).toBe('/:param/:param');
+  });
+});
+
+describe('safe technical context', () => {
+  const opts = {
+    allowedHosts: ['api.example.test'],
+    routeWords: ['booking', 'metrics', 'providers', 'categories', 'concerns'],
+  };
+  const secrets = [
+    'jane',
+    'Jane Doe',
+    'patient@example.com',
+    '+447700900123',
+    '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+    'concern=trauma',
+    'trauma',
+    'evil.example.test',
+    'https://',
+  ];
+  const expectNoSecrets = (output: unknown) => {
+    const serialized = JSON.stringify(output);
+    for (const value of secrets) expect(serialized).not.toContain(value);
+  };
+
+  it('keeps validated technical tags and drops the rest', () => {
+    const output = scrubEvent(
+      {
+        tags: {
+          'http.method': 'GET',
+          'http.status_code': '524',
+          'error.code': 'ERR_BAD_RESPONSE',
+          'http.route': '/booking/metrics',
+          runtime: 'ssr',
+          'http.host': 'api.example.test',
+          patient: 'Jane Doe',
+          url: 'https://api.example.test/providers/jane?concern=trauma',
+        },
+      },
+      opts,
+    );
+    expect(output.tags).toEqual({
+      'http.method': 'GET',
+      'http.status_code': '524',
+      'error.code': 'ERR_BAD_RESPONSE',
+      'http.route': '/booking/metrics',
+      runtime: 'ssr',
+      'http.host': 'api.example.test',
+    });
+  });
+
+  it('re-normalizes routes and rejects bad tag values', () => {
+    const output = scrubEvent(
+      {
+        tags: {
+          'http.method': 'get me',
+          'http.status_code': '52',
+          'error.code': 'JANE',
+          'http.route': 'https://evil.example.test/providers/jane?concern=trauma',
+          runtime: 'Jane Doe',
+          'http.host': 'evil.example.test',
+        },
+      },
+      opts,
+    );
+    expect(output.tags).toEqual({ 'http.route': '/providers/:param' });
+    expectNoSecrets(output);
+  });
+
+  it('drops every tag when no options are given except fixed-shape ones', () => {
+    const output = scrubEvent({
+      tags: {
+        'http.status_code': 404,
+        'http.route': '/booking/jane',
+        'http.host': 'api.example.test',
+      },
+    });
+    expect(output.tags).toEqual({
+      'http.status_code': '404',
+      'http.route': '/:param/:param',
+    });
+  });
+
+  it('keeps only whole-string safe messages', () => {
+    const safe = [
+      ['Request failed with status code 524', 'Request failed with status code 524'],
+      ['Network Error', 'Network Error'],
+      ['timeout of 1500ms exceeded', 'timeout of 1500ms exceeded'],
+      ['canceled', 'canceled'],
+      ['Failed to fetch', 'Failed to fetch'],
+      ['Load failed', 'Load failed'],
+      ['Loading chunk 123 failed.', 'Loading chunk 123 failed.'],
+      [
+        'Minified React error #418; visit https://react.dev/errors/418?args[]=Jane for the full message',
+        'Minified React error #418',
+      ],
+      [
+        "Hydration failed because the server rendered HTML didn't match the client. Jane Doe",
+        "Hydration failed because the server rendered HTML didn't match the client.",
+      ],
+    ];
+    for (const [input, expected] of safe) {
+      const output = scrubEvent({
+        message: input,
+        exception: { values: [{ type: 'Error', value: input }] },
+      });
+      expect(output.message).toBe(expected);
+      expect(output.exception?.values?.[0].value).toBe(expected);
+    }
+  });
+
+  it('redacts messages that only look safe', () => {
+    for (const input of [
+      'Request failed with status code 524 for patient@example.com',
+      'Network Error: jane',
+      'timeout of 1500ms exceeded on /providers/jane',
+      'Loading chunk jane failed. (error: https://evil.example.test/x.js)',
+      'Patient Jane Doe could not book',
+      'Request failed with status code 5241',
+    ]) {
+      const output = scrubEvent({
+        message: input,
+        exception: { values: [{ type: 'AxiosError', value: input }] },
+      });
+      expect(output.message).toBe('[REDACTED]');
+      expect(output.exception?.values?.[0].value).toBe('[REDACTED]');
+    }
+  });
+
+  it('keeps a fingerprint made only of already-safe values', () => {
+    const output = scrubEvent(
+      {
+        tags: { runtime: 'ssr', 'http.route': '/booking/metrics', 'http.status_code': '524' },
+        exception: { values: [{ type: 'AxiosError', value: 'x' }] },
+        fingerprint: ['AxiosError', 'ssr', '/booking/metrics', '524'],
+      },
+      opts,
+    );
+    expect(output.fingerprint).toEqual(['AxiosError', 'ssr', '/booking/metrics', '524']);
+  });
+
+  it('drops a fingerprint with any unvalidated element', () => {
+    for (const fingerprint of [
+      ['AxiosError', 'jane'],
+      ['AxiosError', '/providers/jane'],
+      ['{{ default }}', '01ARZ3NDEKTSV4RRFFQ69G5FAV'],
+    ]) {
+      const output = scrubEvent(
+        {
+          tags: { runtime: 'ssr' },
+          exception: { values: [{ type: 'AxiosError', value: 'x' }] },
+          fingerprint,
+        },
+        opts,
+      );
+      expect(output.fingerprint).toBeUndefined();
+    }
+    const kept = scrubEvent({ fingerprint: ['{{ default }}'] });
+    expect(kept.fingerprint).toEqual(['{{ default }}']);
+  });
+
+  it('keeps request breadcrumb method, status and normalized route only', () => {
+    const output = scrubEvent(
+      {
+        breadcrumbs: [
+          {
+            type: 'http',
+            category: 'xhr',
+            level: 'error',
+            timestamp: 1,
+            message: 'GET https://api.example.test/providers/jane',
+            data: {
+              method: 'GET',
+              status_code: 404,
+              url: 'https://api.example.test/providers/jane?concern=trauma',
+              route: '/providers/jane',
+              body: 'patient@example.com',
+            },
+          },
+          {
+            category: 'navigation',
+            timestamp: 2,
+            data: { from: '/providers/jane', to: '/booking', route: '/booking' },
+          },
+          {
+            category: 'console',
+            message: 'Jane Doe',
+            data: { arguments: ['Jane Doe'] },
+          },
+          { category: '/providers/jane', message: 'x' },
+        ],
+      },
+      opts,
+    );
+    expect(output.breadcrumbs).toEqual([
+      {
+        type: 'http',
+        category: 'xhr',
+        level: 'error',
+        timestamp: 1,
+        data: { method: 'GET', status_code: 404, route: '/providers/:param' },
+      },
+      { category: 'navigation', timestamp: 2, data: { route: '/booking' } },
+      { category: 'console' },
+      {},
+    ]);
+    expectNoSecrets(output);
+  });
+
+  it('passes options through createBeforeSend', () => {
+    const beforeSend = createBeforeSend({ dropWarnings: true, ...opts });
+    const output = beforeSend({
+      level: 'error',
+      tags: { 'http.host': 'api.example.test', 'http.route': '/booking/jane' },
+    });
+    expect(output).toEqual({
+      level: 'error',
+      tags: { 'http.host': 'api.example.test', 'http.route': '/booking/:param' },
+    });
   });
 });
